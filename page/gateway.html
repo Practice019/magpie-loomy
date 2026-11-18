@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>讯飞 Loomy</title>
+  <!--
+    带路页：把 magpie 的框架导航到管理面板服务。
+
+    # 为什么必须导航而不是在沙盒里画
+    magpie 的插件页是沙盒 iframe（sandbox="allow-scripts"，CSP connect-src 'none'）：
+    页面内没有 fetch / WebSocket，所以「账号列表、任务进度、邀请码」这些需要
+    实时数据的界面**不可能**画在这里。
+
+    解法是 magpie 官方支持的 magpie.page.service：页面把自己导航到插件服务上。
+    导航之后就是插件自己的 origin，沙盒 CSP 不再适用。
+
+    # 两个目标
+    window.magpie.service      magpie web 在自己域名下替插件服务转发的路径 ——
+                               用它，页面留在 magpie 的 origin 里，由 magpie 的 key 保护
+    桌面窗口没有 service       回退到本机 http://127.0.0.1:<port>/
+
+    <meta refresh> 是兜底：脚本被 CSP 拦掉、或 bridge 握手卡住时也能跳。
+    ⚠ 不探测服务：页面 CSP 是 connect-src 'none'，探测必失败。
+  -->
+  <meta id="go" http-equiv="refresh" content="8;url=http://127.0.0.1:4391/">
+  <style>
+    :root { color-scheme: light dark; }
+    html, body { margin: 0; height: 100%; }
+    body {
+      display: grid; place-items: center;
+      font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      background: Canvas; color: CanvasText;
+    }
+    .box { text-align: center; color: GrayText; max-width: 420px; padding: 0 20px; }
+    .box b { display: block; color: CanvasText; font-size: 14px; margin-bottom: 10px; }
+    .bar {
+      width: 200px; height: 3px; border-radius: 2px;
+      background: color-mix(in srgb, CanvasText 14%, transparent);
+      overflow: hidden; margin: 0 auto 10px;
+    }
+    .bar i { display: block; height: 100%; width: 12%; border-radius: 2px; background: AccentColor; transition: width .4s ease; }
+    .bar.bad i { background: #f85149; }
+    .box span { display: block; font-size: 11.5px; min-height: 2.4em; }
+    .box span.bad { color: #f85149; }
+    .box a { color: AccentColor; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <b>Loomy 管理面板</b>
+    <div class="bar"><i id="bar"></i></div>
+    <span id="msg">正在打开面板…</span>
+    <p><a id="manual" href="http://127.0.0.1:4391/">手动打开</a></p>
+  </div>
+  <script src="_magpie/bridge.js"></script>
+  <script src="boot.js"></script>
+</body>
+</html>
