@@ -75,9 +75,9 @@ function matches(el, selector) {
 }
 
 const accounts = [
-  { uid: "u0", phone: "mock-phone-0", name: "Alpha", firstLogin: true, quota: { windows: [{ name: "可用总额", amount: 120 }, { name: "每日赠送", amount: 20 }, { name: "永久积分", amount: 100 }] } },
-  { uid: "u1", phone: "mock-phone-1", name: "Beta", firstLogin: false },
-  { uid: "u2", phone: "mock-phone-2", name: "Gamma", firstLogin: null },
+  { uid: "u0", phone: "mock-phone-0", name: "Alpha", firstLogin: true, cached: true, at: 1795052000000, quota: { windows: [{ name: "可用总额", amount: 120 }, { name: "每日赠送", amount: 20 }, { name: "永久积分", amount: 100 }] } },
+  { uid: "u1", phone: "mock-phone-1", name: "Beta", firstLogin: false, cached: false, at: 0 },
+  { uid: "u2", phone: "mock-phone-2", name: "Gamma", firstLogin: null, cached: false, at: 0 },
 ]
 const inviteRows = [
   { uid: "u0", activation: { activated: false }, codes: [{ code: "OWN-A", usedCount: 2, maxUses: 0 }] },
@@ -106,10 +106,12 @@ async function fixture(handler, navigator = {}, localStorage) {
       if (custom !== undefined) return custom
       const select = (rows) => call.uids === null ? rows : rows.filter((row) => call.uids.split(",").includes(row.uid))
       const data = call.path === "/api/settings" ? { accountConcurrency: 20, bindConcurrency: 20, ...call.body }
-        : call.path === "/api/accounts" ? { accounts: select(accounts) }
-        : call.path === "/api/tasks" ? { rows: select(accounts.map((a) => ({ uid: a.uid, tasks: Object.fromEntries(Array.from({ length: 8 }, (_, i) => [`task${i}`, a.uid === "u0"])) }))) }
+        : call.path === "/api/accounts" ? { accounts: select(accounts), updatedAt: 1795052000000 }: call.path === "/api/hello" ? { ok: true, since: 1795050000000, uptimeMs: 600000, pid: 4242 }: call.path === "/api/route-state" ? { ok: true, state: { u1: { verdict: "routed", reason: "ledger-spark", label: "已被上游限制 · 整号停用（实际 → spark-x2.6-low）", costHint: "已扣 1 积分" } } }
+        : call.path === "/api/tasks" ? { rows: select(accounts.map((a) => ({ uid: a.uid, cached: true, at: 1795052000000, tasks: Object.fromEntries(Array.from({ length: 8 }, (_, i) => [`task${i}`, a.uid === "u0"])) }))) }
           : call.path === "/api/invite" ? { rows: select(inviteRows) }
             : call.path === "/api/do" ? { ok: true, bound: 1, failed: 0, requested: 1, unassigned: 0, results: [{ uid: "u0", code: "CODE", ok: true }] }
+            : call.path === "/api/accounts-refresh" ? { ok: true, uid: "u0", balance: 120, at: 1795052000000 }
+            : call.path === "/api/accounts-refresh-batch" ? (init.method === "POST" ? { ok: true, jobId: "job-1", total: (call.body?.uids ?? []).length || 1 } : { ok: true, job: { jobId: "job-1", total: 1, done: 1, okCount: 1, failCount: 0, running: false, stopped: "", results: {} } })
               : assert.fail(`Unexpected request: ${url}`)
       return response(data)
     })()
@@ -144,13 +146,14 @@ test("并发首屏默认 20、输入范围一致，服务端设置优先于本�
   const cache = new Map([["loomy.panel.accountConcurrency", "2"]])
   const localStorage = { getItem: (key) => cache.get(key), setItem: (key, value) => cache.set(key, value) }
   const defaults = await fixture()
-  for (const selector of ["#account-concurrency", "#bind-conc"]) {
+  for (const selector of ["#setting-account-concurrency", "#bind-conc"]) {
     assert.equal(defaults.get(selector).value, "20")
-    assert.equal(defaults.get(selector).getAttribute("max"), "50")
+    // ⚠ 并发输入**没有上限**（用户要求）：不再有 max 属性
+    assert.equal(defaults.get(selector).getAttribute("max"), null)
     assert.equal(defaults.get(selector).getAttribute("min"), "1")
   }
   const f = await fixture((c) => c.path === "/api/settings" ? response({ accountConcurrency: 50, bindConcurrency: 1 }) : undefined, {}, localStorage)
-  assert.equal(f.get("#account-concurrency").value, "50")
+  assert.equal(f.get("#setting-account-concurrency").value, "50")
   assert.equal(f.get("#bind-conc").value, "1")
   assert.equal(cache.get("loomy.panel.accountConcurrency"), "50")
   assert.equal(cache.get("loomy.panel.bindConcurrency"), "1")
@@ -167,14 +170,15 @@ test("两种并发仅 change 保存整数，刷新重开恢复且不丢邀请码
   }
   const f = await fixture(handler, {}, localStorage)
   await f.input("#bind-codes", "KEEP\nCODES")
-  for (const [selector, value] of [["#account-concurrency", "50"], ["#bind-conc", "1"]]) {
+  for (const [selector, value] of [["#setting-account-concurrency", "50"], ["#bind-conc", "1"]]) {
     await f.input(selector, value)
     await f.get(selector).emit("keyup")
     assert.equal(f.calls.filter((c) => c.body && c.path === "/api/settings").length, selector === "#bind-conc" ? 1 : 0)
     await f.get(selector).emit("change")
   }
   assert.deepEqual(settings, { accountConcurrency: 50, bindConcurrency: 1 })
-  for (const value of ["0", "51", "1.5", "", "no"]) {
+  // 51 现在**合法**（无上限），只留真正非法的值
+  for (const value of ["0", "1.5", "", "no"]) {
     await f.input("#bind-conc", value)
     await f.get("#bind-conc").emit("change")
   }
@@ -182,7 +186,7 @@ test("两种并发仅 change 保存整数，刷新重开恢复且不丢邀请码
   assert.equal(cache.get("loomy.panel.bindConcurrency"), "1")
   assert.equal(f.get("#bind-codes").value, "KEEP\nCODES")
   const reopened = await fixture(handler, {}, localStorage)
-  assert.equal(reopened.get("#account-concurrency").value, "50")
+  assert.equal(reopened.get("#setting-account-concurrency").value, "50")
   assert.equal(reopened.get("#bind-conc").value, "1")
 })
 
@@ -205,7 +209,7 @@ test("设置读取和保存失败明确提示，缓存回退且页面操作可�
   const cache = new Map([["loomy.panel.accountConcurrency", "7"], ["loomy.panel.bindConcurrency", "bad"]])
   const localStorage = { getItem: (key) => cache.get(key), setItem: (key, value) => cache.set(key, value) }
   const f = await fixture((c) => c.path === "/api/settings" ? response({ error: "mock settings offline" }, 503) : undefined, {}, localStorage)
-  assert.equal(f.get("#account-concurrency").value, "7")
+  assert.equal(f.get("#setting-account-concurrency").value, "7")
   assert.equal(f.get("#bind-conc").value, "20")
   assert.match(f.get("#toast").textContent, /并发设置读取失败/)
   await f.input("#bind-codes", "KEEP")
@@ -236,12 +240,12 @@ for (const concurrency of [1, 20, 50]) {
     })
     f.get("#select-all").checked = true
     await f.get("#accounts-list").emit("change", { target: f.get("#select-all") })
-    await f.input("#account-concurrency", String(concurrency))
+    await f.input("#setting-account-concurrency", String(concurrency))
     await f.get("#account-init").click()
     await f.settle()
     assert.equal(peak, Math.min(concurrency, 23))
     assert.equal(f.calls.filter((c) => c.path === "/api/do").length, 23)
-    await f.input("#account-concurrency", "51")
+    await f.input("#setting-account-concurrency", "0")
     await f.get("#account-init").click()
     await f.settle()
     assert.equal(f.calls.filter((c) => c.path === "/api/do").length, 23)
@@ -250,7 +254,7 @@ for (const concurrency of [1, 20, 50]) {
 
 test("真实 app 首屏加载 mock 账号、任务、积分与三态邀请字段", async () => {
   const f = await fixture()
-  assert.deepEqual(f.calls.map((c) => c.path).sort(), ["/api/accounts", "/api/invite", "/api/settings", "/api/tasks"])
+  assert.deepEqual(f.calls.map((c) => c.path).sort(), ["/api/accounts", "/api/hello", "/api/invite", "/api/route-state", "/api/settings", "/api/tasks"])
   assert.equal(f.get("#account-summary").textContent, "显示 3 / 3 · 已选 0")
   const table = f.get("#accounts-list").innerHTML
   for (const label of ["手机号", "昵称", "初始化", "任务", "积分", "邀请", "操作", "Alpha", "mock-phone-0", "8/8", "每日 20", "永久 100", "已初始化", "未初始化", "未知"]) assert.ok(table.includes(label), label)
@@ -258,15 +262,21 @@ test("真实 app 首屏加载 mock 账号、任务、积分与三态邀请字段
   assert.match(f.get("#invite-list").innerHTML, /已绑定 APPLIED-B/)
   assert.match(f.get("#bind-pool").textContent, /可用未绑定账号 1 个/)
   assert.equal(f.get("#status").className, "status ok")
-  for (const [id, value] of [["total", "3"], ["init", "1"], ["tasks", "1"], ["bound", "1"]]) assert.equal(f.get(`#stat-${id}`).textContent, value)
+  // 统计卡片只剩三张：总数 / 健康 / 不健康（旧的 init/tasks/bound 已按截图删除）
+  for (const id of ["stat-init", "stat-tasks", "stat-bound"]) assert.equal(f.document.querySelector(`#${id}`), null, id)
+  assert.equal(f.get("#stat-total").textContent, "3")
+  // mock 里 u1 是 routed → 健康 0、不健康 1、未检测 2
+  assert.equal(f.get("#stat-healthy").textContent, "0")
+  assert.equal(f.get("#stat-unhealthy").textContent, "1")
+  assert.match(f.get("#stat-unhealthy-note").textContent, /另有 2 个未检测/)
 })
 
 test("三标签页及方向键、Home、End 切换与 ARIA 状态对应", async () => {
   const f = await fixture()
-  assert.equal(f.document.querySelectorAll(".tab").length, 3)
-  assert.equal(f.document.querySelectorAll(".pane").length, 3)
+  assert.equal(f.document.querySelectorAll(".tab").length, 4)
+  assert.equal(f.document.querySelectorAll(".pane").length, 4)
   const check = (active) => {
-    for (const name of ["accounts", "invite", "logs"]) {
+    for (const name of ["accounts", "invite", "logs", "settings"]) {
       const on = name === active
       assert.equal(f.get(`#pane-${name}`).hidden, !on)
       assert.equal(f.get(`#tab-${name}`).getAttribute("aria-selected"), String(on))
@@ -278,7 +288,7 @@ test("三标签页及方向键、Home、End 切换与 ARIA 状态对应", async 
   check("accounts")
   await f.get("#tab-invite").click()
   check("invite")
-  for (const [from, key, to] of [["invite", "ArrowRight", "logs"], ["logs", "ArrowRight", "accounts"], ["accounts", "ArrowLeft", "logs"], ["logs", "Home", "accounts"], ["accounts", "End", "logs"], ["logs", "ArrowLeft", "invite"]]) {
+  for (const [from, key, to] of [["invite", "ArrowRight", "logs"], ["logs", "ArrowRight", "settings"], ["settings", "ArrowRight", "accounts"], ["accounts", "ArrowLeft", "settings"], ["logs", "Home", "accounts"], ["accounts", "End", "settings"], ["logs", "ArrowLeft", "invite"]]) {
     let prevented = false
     await f.get(`#tab-${from}`).emit("keydown", { key, preventDefault() { prevented = true } })
     check(to)
@@ -299,7 +309,7 @@ test("账号筛选、全选仅作用筛选结果且请求使用已选 UID", asyn
   assert.match(f.get("#account-summary").textContent, /已选 1/)
   await f.get("#account-balance").click()
   await f.settle()
-  assert.equal(f.calls.at(-1).uids, "u0")
+  assert.deepEqual(f.calls.find((c) => c.path === "/api/accounts-refresh-batch" && c.init.method === "POST").body.uids, ["u0"])
   for (const [filter, name] of [["bound", "Beta"], ["unbound", "Alpha"], ["unknown", "Gamma"]]) {
     await f.input("#account-filter", filter)
     assert.match(f.get("#account-summary").textContent, /显示 1 \/ 3/)
@@ -327,7 +337,16 @@ for (const mode of ["one-each", "one-many"]) {
     assert.deepEqual(call.body, { action: "bind-invite-bulk", mode, codes: mode === "one-each" ? "A\nB" : "CODE", count: mode === "one-many" ? 4 : 1, concurrency: 2 })
     assert.equal(call.init.method, "POST")
     assert.equal(call.init.headers["Content-Type"], "application/json")
-    assert.deepEqual(f.calls.slice(-2).map((c) => c.path).sort(), ["/api/accounts", "/api/invite"])
+    // ⚠ 绑定后刷新集合多了 tasks / route-state（都是只读缓存接口）
+    // 绑定成功的「后续刷新」= 三个缓存型 GET（accounts / route-state / invite）。
+    // ⚠ 不要用「最后 4 条」这种脆弱切片：绑定后的刷新集合可能随实现增减。
+    const tail = f.calls.slice(f.calls.findIndex((c) => c.path === "/api/do")).map((c) => c.path)
+    // 绑定后的刷新只涉及「账号余额 + 邀请码」两处缓存（路由状态属于检测任务，
+    // 由 route-check / patrol 自己收尾时重读，不该被绑定动作顺手拉一次）
+    for (const path of ["/api/accounts", "/api/invite"]) {
+      assert.ok(tail.includes(path), `绑定后应刷新 ${path}：${tail.join(",")}`)
+    }
+    assert.ok(!tail.some((p) => p.endsWith("-refresh-batch")), "回调里不得启动新任务（会重复扣积分）")
     assert.match(f.get("#operation-log").textContent, /成功/)
   })
 }
@@ -346,7 +365,8 @@ test("绑定参数无效时不发送请求", async () => {
   await f.mode("one-many")
   for (const codes of ["", "A\nB", "A\rB"]) await check(codes, "1", "3")
   for (const count of ["0", "1.5", "1000", "no"]) await check("CODE", count, "3")
-  for (const concurrency of ["0", "51", "1.5"]) await check("CODE", "1", concurrency)
+  // 51 不再是非法值（并发无上限），只留 ≥1 之外与小数
+  for (const concurrency of ["0", "1.5"]) await check("CODE", "1", concurrency)
 })
 
 for (const kind of ["HTTP", "error", "network", "JSON"]) {
@@ -389,7 +409,7 @@ test("忙碌时禁用操作且直接重复事件也不重发请求", async () =>
     await f.get("#refresh").emit("click")
     await f.get("#invite-list").emit("click", { target: f.get('[data-bind-uid="u0"]') })
     assert.equal(f.calls.filter((c) => c.path === "/api/do").length, 1)
-    assert.equal(f.calls.length, 5)
+    assert.equal(f.calls.length, 7)
   } finally { release() }
   await f.settle()
   assert.equal(f.get("#bind-run").disabled, false)
@@ -440,7 +460,7 @@ test("账号和邀请码表格无块级详情，多码横排且小屏保持紧�
   for (const id of ["accounts-list", "invite-list"]) assert.doesNotMatch(f.get(`#${id}`).innerHTML, /<(?:small|br)\b/)
   assert.match(f.get("#invite-list").innerHTML, /class="invite-codes"/)
   assert.match(f.get("#invite-list").innerHTML, /title="昵称：Alpha；用户 ID：u0"/)
-  assert.match(f.get("#accounts-list").innerHTML, /class="quota-inline" title="每日 20 · 永久 100"/)
+  assert.match(f.get("#accounts-list").innerHTML, /class="quota-inline" title="每日 20 · 永久 100；截至 /)
   assert.match(css, /\.table-wrap\s*\{[^}]*overflow:\s*auto/)
   assert.match(css, /table\s*\{[^}]*width:\s*max-content/)
   assert.match(css, /\.quota-inline, \.invite-codes, \.invite-code\s*\{[^}]*display:\s*inline-flex[^}]*flex-wrap:\s*nowrap/)
@@ -465,7 +485,7 @@ test("日志只在第三页聚合，包含时间来源，可复制和清空", as
   const text = f.get("#operation-log").textContent
   assert.match(text, /\[[^\]\n]+\] \[账号\] 开始补齐任务/)
   assert.match(text, /\[[^\]\n]+\] \[绑定\] 开始绑定/)
-  assert.match(text, /\[刷新\]/)
+  assert.match(text, /\[账号\] 已读取本地缓存/)
   await f.get("#logs-copy").click()
   assert.deepEqual(copied, [text])
   await f.get("#logs-clear").click()
@@ -580,7 +600,7 @@ test("复制邀请码成功、权限拒绝和不可用均给出准确提示", as
     assert.equal(f.get("#toast").classList.contains("bad"), kind !== "ok")
     if (kind === "ok") assert.deepEqual(copied, ["OWN-A"])
     else assert.match(f.get("#toast").textContent, /请手动选择邀请码复制/)
-    assert.equal(f.calls.length, 4)
+    assert.equal(f.calls.length, 6)
   }
 })
 
@@ -603,16 +623,24 @@ test("首次查询网络失败使用人话且不触发写操作", async () => {
   const f = await fixture(() => { throw new TypeError("Failed to fetch") })
   assert.match(f.get("#toast").textContent, /无法连接面板服务/)
   assert.doesNotMatch(f.get("#toast").textContent, /Failed to fetch/)
-  assert.equal(f.calls.length, 2)
+  assert.equal(f.calls.length, 3)
   assert.equal(f.get("#status").className, "status bad")
 })
 
-for (const path of ["/api/accounts", "/api/tasks", "/api/invite"]) {
+// ⚠ accounts 不在这一组了：缓存里的「上次查询失败」是提示，不是页面错误
+//（面板不自动查余额，某个号上次失败不该把整页标红）
+for (const path of ["/api/tasks", "/api/invite"]) {
   test(`${path} 局部业务查询错误不显示更新成功`, async () => {
-    const f = await fixture((c) => c.path === path ? response(c.path === "/api/accounts" ? { accounts: [{ ...accounts[0], error: "mock rejected" }] } : { rows: [{ uid: "u0", error: "mock rejected" }] }) : undefined)
+    const f = await fixture((c) => c.path === path ? response({ rows: [{ uid: "u0", error: "mock rejected" }] }) : undefined)
     assert.equal(f.get("#status").className, "status bad")
   })
 }
+
+test("/api/accounts 的缓存失败只作提示，不影响页面状态", async () => {
+  const f = await fixture((c) => c.path === "/api/accounts" ? response({ accounts: [{ ...accounts[0], error: "mock rejected", cached: true }] }) : undefined)
+  assert.equal(f.get("#status").className, "status ok")
+  assert.match(f.get("#accounts-list").innerHTML, /上次查询失败/)
+})
 
 test("批量部分失败和 ok:false 携带 results 仍显示失败状态", async () => {
   const f = await fixture((c) => c.path === "/api/do" ? response({ ok: false, bound: 1, failed: 1, results: [{ uid: "u0", ok: true }, { uid: "u1", ok: false, error: "mock rejected" }] }) : undefined)

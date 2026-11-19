@@ -13,11 +13,50 @@
 //
 // magpie 的契约：钩子失败 / 抛异常 / 返回空，宿主保留原有列表。
 // 所以这里**主动返回静态表**并在失败时打日志 —— 比让宿主猜更可控。
+//
+// # 被上游限制的账号 → 返回**空目录**（这是「别选我」的唯一正确表达）
+//
+// magpie 的 `plugin-providers.json` 里每个账号都有自己的 `models` 数组，
+// 路由只在这份列表里选模型。实测：184 个号里有 90 个上游只下发
+// `spark-x2.6-low / spark-x2.6-4b`，magpie 就天生不会给它们派 DS4.1。
+//
+// 所以「这个号不要接活」用**目录**说，不用错误码说：
+//
+//	目录空 ⇒ 没有该模型 ⇒ 路由不派活 ⇒ 不产生失败、不触发换号、不触发禁用。
+//
+// 两种结论都置空：
+//
+//	routed   上游把整号改路由（付 2× 拿 spark），发出去是白付钱
+//	expired  session 已过期，发出去只会 401，白耗一次换号
+//
+// ⚠ 注意 `expired` 的「正确 UI 表达」不在本文件，而在 `auth.usage` 的
+// `signIn: "expired"`（magpie 原生字段，会把账号标成「登录已失效」）。
+// 目录这里只是顺手把请求掐掉，避免白白打到失效的 session 上。
+//
+// ⚠ 没有判定（`unknown` / 根本没有记录）**仍然返回完整目录**，这是刻意的：
+// 「未验证」不等于「不可用」。新导入的号在后台探测跑完前一律 unknown，若那时
+// 就给空目录，用户会看到「刚导入就全不能用」。收敛策略是**先给目录 + 后台
+// 探测尽快出结论**（`src/importer.mjs` 导入成功后 `void` 跑一次探测并落盘），
+// 而不是先封后放。
+//
+// ⚠ 曾经反着做过两道：`loader` 回 503（magpie 把 5xx 当账号故障，一批号被
+// 标记失败/禁用 —— 真机事故）、`usage` 报 `used:100`（卡片显示「剩余 0」，
+// 用户以为号没额度了）。两条都已撤掉：**排除只能走目录**。
+//
+// ⚠ 已知风险（留给联调确认）：AGENTS/本文件里记着「钩子失败 / 抛异常 /
+// **返回空**，宿主保留原有列表」。若 magpie 真把 `{}` 当成「这次没拉到」
+// 而沿用旧列表，那空目录这条排除就会静默失效（症状是「照旧被路由」，
+// 而不是「号被禁用」—— 比 503 安全得多）。届时改为给一个哨兵模型也不行，
+// 必须由宿主侧确认空数组的语义。
 
 import { PROVIDER, DEFAULT_BASE_URL, MODELS_PATH } from "../constants.mjs"
 import { modelsAuth } from "./../auth-headers.mjs"
 import { parseNameMultiplier } from "../multipliers.mjs"
 import { availableModels, IMAGE_MODEL_IDS } from "../models.mjs"
+// 路由判定的读取器官在 loader（它是 `accountKeys`/`accountRoute` 的所有者）。
+// 依赖方向：hooks/models → hooks/loader → src/{prepare-body,upstream-facts}，
+// 没有回边，也不会反向摸到 index.mjs。
+import { accountKeys, accountRoute } from "./loader.mjs"
 
 /** 拉目录的超时（一次目录请求不该占住太久）。 */
 const CATALOG_TIMEOUT_MS = 15_000
@@ -25,19 +64,48 @@ const CATALOG_TIMEOUT_MS = 15_000
 /**
  * 构建 `provider.models` 钩子。
  *
- * @param {{baseUrl?: string, fetchImpl?: typeof fetch, log?: {warn: Function}}} [opts]
+ * @param {{baseUrl?: string, fetchImpl?: typeof fetch, log?: {warn: Function},
+ *   configDir?: string, routeStore?: any}} [opts]
+ *   `configDir` / `routeStore`：读「这个账号是不是被上游限制了」。
  * @returns {(provider: any, ctx?: {auth?: any}) => Promise<Record<string, object>>}
  */
 export function makeModelsHook(opts = {}) {
   const baseUrl = String(opts.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, "")
   const doFetch = opts.fetchImpl ?? ((...args) => globalThis.fetch(...args))
   const log = opts.log ?? console
+  const configDir = String(opts.configDir ?? "").trim()
+  const storeOpt = opts.routeStore
 
   return async function models(provider, ctx = {}) {
     const auth = ctx?.auth
     // 未登录：回静态表（否则界面上这个供应商一个模型都没有）
     if (!auth?.access) {
       return toMagpieModels(provider, staticEntries())
+    }
+
+    // ── 空目录：这个号不该再收到任何请求 ──
+    // 先判再拉：既省一次上游请求，也不给宿主任何「其实它能用」的暗示。
+    // 三种结论都置空：
+    //	routed    —— 上游把整号改路由（付 2× 拿 spark），发出去也是白付钱
+    //	expired   —— session 已过期，发出去只会 401，白耗一次换号
+    //	exhausted —— 余额不足（402），发出去只会再 402
+    // ⚠ 这里返回 `{}` 而不是「删掉某个模型」：整号坏（实测 GLM / qwen / 两个
+    // deepseek 全部落到 spark-x2.6-low），只删一个模型等于让别的模型继续被换掉。
+    const hit = await lookupRoute(auth, { configDir, routeStore: storeOpt })
+    const verdict = hit?.entry?.verdict
+    if (verdict === "routed" || verdict === "expired" || verdict === "exhausted") {
+      try {
+        log.warn?.(
+          verdict === "expired"
+            ? `loomy: 账号 ${hit.key} 登录已失效（session 过期），目录置空（不派活）`
+            : verdict === "exhausted"
+              ? `loomy: 账号 ${hit.key} 积分余额不足（上游 402），目录置空（不派活）`
+              : `loomy: 账号 ${hit.key} 已被上游限制（全部模型实际由 ${String(hit.entry?.servedModel ?? "").trim() || "上游其它模型"} 服务），目录置空（不派活）`,
+        )
+      } catch {
+        /* 日志失败不是业务失败 */
+      }
+      return {}
     }
 
     try {
@@ -49,6 +117,27 @@ export function makeModelsHook(opts = {}) {
       log.warn?.(`loomy: 拉取实时模型目录失败，回退静态表: ${e?.message ?? e}`)
       return toMagpieModels(provider, staticEntries())
     }
+  }
+}
+
+/**
+ * 读这个账号的路由判定（`{entry, key} | null`）。
+ *
+ * 没有 configDir / 没有可查的键 / 模块缺失 / 读失败 → 一律 null＝「没有判定」，
+ * 调用方据此返回正常目录。**判定读不出来不能让目录变成空的**，否则一次文件
+ * 权限问题就会让所有账号从界面上消失。
+ *
+ * @param {any} auth
+ * @param {{configDir?: string, routeStore?: any}} opts
+ * @returns {Promise<{entry: any, key: string}|null>}
+ */
+async function lookupRoute(auth, opts) {
+  try {
+    const keys = accountKeys(auth)
+    if (keys.length === 0) return null
+    return await accountRoute(opts.configDir, keys, { routeStore: opts.routeStore })
+  } catch {
+    return null
   }
 }
 

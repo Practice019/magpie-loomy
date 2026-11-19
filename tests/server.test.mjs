@@ -9,6 +9,32 @@ import { TASK_DEFS } from "../src/points.mjs"
 import { toSignInResult } from "../src/importer.mjs"
 import { parseCredential, marshalCredential } from "../src/credential.mjs"
 
+/**
+ * `GET /api/settings` 的完整期望集合（第十三～二十轮把并发拆成了每个 job 一条，
+ * 并加了 `gapMs` / `autoApply` / `magpiePath`）。
+ *
+ * ⚠ 这些键是**用户明确要求**的：凡是涉及并发的地方都要能在设置里调；
+ *   不许为了让测试变绿而把它们从服务端删掉。
+ */
+const EXPECTED_SETTINGS = Object.freeze({
+  accountConcurrency: 20,
+  bindConcurrency: 20,
+  routeConcurrency: 2,
+  batchConcurrency: 2,
+  balanceConcurrency: 2,
+  tasksConcurrency: 2,
+  inviteConcurrency: 2,
+  patrolConcurrency: 2,
+  gapMs: 300,
+  autoApply: true,
+  magpiePath: "",
+  batchSkipChecked: true,
+  ledgerReads: 3,
+})
+
+/** 只有 legacy 两项变了（并发两键的合并测试里用）。 */
+const withLegacy = (accountConcurrency, bindConcurrency) => ({ ...EXPECTED_SETTINGS, accountConcurrency, bindConcurrency })
+
 async function fixture(t, handler, count = 3, options = {}) {
   const dir = mkdtempSync(join(tmpdir(), "loomy-panel-test-"))
   const auth = Object.fromEntries(Array.from({ length: count }, (_, i) => [`loomy#${i}`, { access: `fake-session-${i}`, metadata: { uid: `u${i}`, nickname: `名字${i}`, phone: `phone${i}`, ...(i === 0 ? { firstLogin: false } : {}) } }]))
@@ -112,7 +138,7 @@ test("旧绑定字段不影响分配且首登和用户状态文件保持不变",
   const file = join(f.dir, "loomy-panel-state.json")
   writeFileSync(file, original)
   await f.restart()
-  assert.deepEqual(Object.keys(await f.api("/api/invite")), ["rows"])
+  assert.deepEqual(Object.keys(await f.api("/api/invite")).sort(), ["cached", "rows", "updatedAt"])
   assert.deepEqual((await f.api("/api/invite?uids=u1")).rows.map((r) => r.uid), ["u1"])
   const result = await f.api("/api/do", { ...bulk, count: 3 })
   assert.equal(result.bound, 3)
@@ -123,7 +149,7 @@ test("旧绑定字段不影响分配且首登和用户状态文件保持不变",
   assert.equal(readFileSync(file, "utf8"), original)
 })
 
-test("列表查询有界并发且顺序稳定，未知激活不标未绑定", async (t) => {
+test("列表查询只读缓存：零上游请求、顺序稳定、未知激活不标未绑定", async (t) => {
   let active = 0
   let peak = 0
   const f = await fixture(t, async (c) => {
@@ -136,11 +162,13 @@ test("列表查询有界并发且顺序稳定，未知激活不标未绑定", as
   for (const path of ["accounts", "tasks", "invite"]) {
     peak = 0
     const response = await f.api("/api/" + path)
-    assert.equal(peak, 4)
+    // ⚠ 这三个列表现在**一发上游请求都不发**（只读缓存）：刷新走各自的 refresh 任务
+    assert.equal(peak, 0, `${path} 不得在列表接口里打上游`)
     const rows = response.accounts ?? response.rows
     assert.deepEqual(rows.map((r) => r.uid), Array.from({ length: 9 }, (_, i) => `u${i}`))
     if (path === "invite") assert.ok(rows.every((r) => r.activation === null))
   }
+  assert.equal(f.calls.length, 0)
 })
 
 test("上游错误脱敏且 action 错误结构保持", async (t) => {
@@ -152,11 +180,13 @@ test("上游错误脱敏且 action 错误结构保持", async (t) => {
   assert.equal(result.ok, false)
   assert.equal(result.failed[0].key, "first-login")
   assert.match(result.failed[0].error, /POST \/points\/first-login.*网络请求失败/)
+  // tasks/invite/accounts 都改成只读缓存（零上游请求），上游错误只会出现在 /api/do
   for (const path of ["accounts", "tasks", "invite"]) {
     const text = JSON.stringify(await f.api("/api/" + path))
-    assert.equal(/fake-session|private body/.test(text), false)
-    assert.match(text, /FAIL/)
+    assert.equal(/fake-session|private body|FAIL/.test(text), false)
   }
+  // 错误结构保留，但正文里的 session 必须被脱敏（不出现 FAIL 原样回显也没关系）
+  assert.equal(/fake-session|private body/.test(JSON.stringify(result)), false)
 })
 
 test("保留真实昵称且宿主 accountId 仍显示手机号", async () => {
@@ -173,7 +203,7 @@ test("限定账号、三态 metadata、无 session 输出", async (t) => {
   const f = await fixture(t)
   const result = await f.api("/api/accounts?uids=" + encodeURIComponent("u0,u2,unknown"))
   assert.deepEqual(result.accounts.map((a) => [a.uid, a.phone, a.firstLogin]), [["u0", "phone0", false], ["u2", "phone2", null]])
-  assert.deepEqual(Object.keys(result.accounts[0]).sort(), ["uid", "name", "phone", "firstLogin", "quota", "error"].sort())
+  assert.deepEqual(Object.keys(result.accounts[0]).sort(), ["uid", "name", "phone", "firstLogin", "quota", "error", "cached", "at"].sort())
   assert.equal(JSON.stringify(result).includes("fake-session"), false)
   assert.equal((await f.api("/api/tasks?uids=u1")).rows.length, 1)
   assert.equal((await f.api("/api/invite?uids=u1")).rows[0].uid, "u1")
@@ -264,33 +294,61 @@ test("已激活和未知状态不候选，单账号也检查", async (t) => {
 
 test("设置默认 20、分别合并持久化且重启保留，不访问上游或宿主账号", async (t) => {
   const f = await fixture(t)
-  assert.deepEqual(await f.api("/api/settings"), { accountConcurrency: 20, bindConcurrency: 20 })
+  // ⚠ 形状变了：`{ok, settings, defaults}`（设置 tab 要显示默认值）
+  const first = await f.api("/api/settings")
+  assert.equal(first.ok, true)
+  assert.deepEqual(first.settings, EXPECTED_SETTINGS)
+  assert.deepEqual(first.defaults, first.settings)
   const accounts = { u0: { firstLogin: true } }
   writeFileSync(join(f.dir, "loomy-panel-state.json"), JSON.stringify({ accounts }))
   await f.restart()
-  assert.deepEqual(await f.api("/api/settings", { accountConcurrency: 1 }), { accountConcurrency: 1, bindConcurrency: 20 })
-  assert.deepEqual(await f.api("/api/settings", { bindConcurrency: 50 }), { accountConcurrency: 1, bindConcurrency: 50 })
+  assert.deepEqual((await f.api("/api/settings", { accountConcurrency: 1 })).settings, withLegacy(1, 20))
+  assert.deepEqual((await f.api("/api/settings", { bindConcurrency: 50 })).settings, withLegacy(1, 50))
   await f.restart()
-  assert.deepEqual(await f.api("/api/settings"), { accountConcurrency: 1, bindConcurrency: 50 })
+  assert.deepEqual((await f.api("/api/settings")).settings, withLegacy(1, 50))
   assert.deepEqual(JSON.parse(readFileSync(join(f.dir, "loomy-panel-state.json"), "utf8")), { accounts, settings: { accountConcurrency: 1, bindConcurrency: 50 } })
   assert.equal(f.calls.length, 0)
 })
 
 test("设置拒绝非法值、额外字段及非法 JSON，写入失败不改变当前值", async (t) => {
   const f = await fixture(t)
-  for (const body of ["{", null, [], {}, { other: 20 }, { accountConcurrency: 20, accounts: {} }, ...[0, 51, 1.5, "20", true, null].flatMap((value) => [{ accountConcurrency: value }, { bindConcurrency: value }])]) {
+  for (const body of ["{", null, [], {}, { other: 20 }, { accountConcurrency: 20, accounts: {} }, ...[0, 1.5, "20", true, null].flatMap((value) => [{ accountConcurrency: value }, { bindConcurrency: value }])]) {
     assert.equal((await f.raw("POST", "/api/settings", body)).status, 400)
   }
-  assert.deepEqual(await f.api("/api/settings"), { accountConcurrency: 20, bindConcurrency: 20 })
+  // 新键的校验（第 17/18 轮新增）：并发必须整数 ≥1，gapMs 0..5000，类型要对
+  for (const body of [
+    { routeConcurrency: 0 },
+    { routeConcurrency: 1.5 },
+    { tasksConcurrency: 1.5 },
+    { inviteConcurrency: 0 },
+    { patrolConcurrency: "3" },
+    { balanceConcurrency: -1 },
+    { gapMs: -1 },
+    { gapMs: 9999 },
+    { gapMs: 1.5 },
+    { autoApply: "true" },
+    { magpiePath: 123 },
+  ]) {
+    assert.equal((await f.raw("POST", "/api/settings", body)).status, 400, JSON.stringify(body))
+    assert.deepEqual((await f.api("/api/settings")).settings, EXPECTED_SETTINGS, `${JSON.stringify(body)} 不得写盘`)
+  }
+  // gapMs 的边界是可用的（0 = 不等待，5000 = 上限）
+  assert.equal((await f.raw("POST", "/api/settings", { gapMs: 0 })).status, 200)
+  assert.equal((await f.api("/api/settings")).settings.gapMs, 0)
+  assert.equal((await f.raw("POST", "/api/settings", { gapMs: 5000 })).status, 200)
+  assert.equal((await f.api("/api/settings")).settings.gapMs, 5000)
+  assert.equal((await f.raw("POST", "/api/settings", { gapMs: 300 })).status, 200)
+
+  assert.deepEqual((await f.api("/api/settings")).settings, EXPECTED_SETTINGS)
   mkdirSync(join(f.dir, "loomy-panel-state.json"))
   assert.equal((await f.raw("POST", "/api/settings", { accountConcurrency: 30 })).status, 500)
-  assert.deepEqual(await f.api("/api/settings"), { accountConcurrency: 20, bindConcurrency: 20 })
+  assert.deepEqual((await f.api("/api/settings")).settings, EXPECTED_SETTINGS)
 
 })
 
 test("无 configDir 时读取默认值，保存明确失败且不访问宿主或上游", async (t) => {
   const f = await fixture(t, undefined, 0, { configDir: "" })
-  assert.deepEqual(await f.api("/api/settings"), { accountConcurrency: 20, bindConcurrency: 20 })
+  assert.deepEqual((await f.api("/api/settings")).settings, EXPECTED_SETTINGS)
   const result = await f.raw("POST", "/api/settings", { bindConcurrency: 30 })
   assert.equal(result.status, 503)
   assert.match(JSON.parse(result.text).error, /configDir/)

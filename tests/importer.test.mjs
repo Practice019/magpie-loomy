@@ -141,13 +141,23 @@ test("import 一条坏数据不影响同批的好数据", async () => {
   assert.equal(r.filter((x) => x.type === "failed").length, 1)
 })
 
-test("import 最多收 IMPORT_MOST 条（magpie 的上限）", async () => {
-  const h = makeImportHook()
+test("import 最多收 IMPORT_MOST 条（magpie 的上限），并把被截掉的条数**说清**", async () => {
+  // 注入探测 + 假时钟：这条测的是截断语义，不该顺带跑 100 次后台探测。
+  const h = makeImportHook({
+    settleMs: 0,
+    clock: { now: () => 0, sleep: async () => {} },
+    probe: async () => ({ verdict: "clean" }),
+  })
   const many = Array.from({ length: 150 }, (_, i) => ({
     session: i.toString(16).padStart(32, "0"),
   }))
   const r = await h.import([JSON.stringify(many)])
-  assert.equal(r.length, IMPORT_MOST)
+
+  // ⚠ 不再静默切片：100 条成功 + 一条 failed 说明还剩 50 条
+  assert.equal(r.filter((x) => x.type === "success").length, IMPORT_MOST)
+  const failed = r.filter((x) => x.type === "failed")
+  assert.equal(failed.length, 1)
+  assert.match(failed[0].error, /还有 50 条/)
 })
 
 test("import 被 abort 时尽早停下", async () => {

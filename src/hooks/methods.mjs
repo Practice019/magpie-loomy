@@ -33,6 +33,34 @@ import { makeImportHook } from "../importer.mjs"
 
 const has = (o, k) => Object.prototype.hasOwnProperty.call(o ?? {}, k)
 
+/**
+ * 取 DS4.1 路由探测模块（`src/route.mjs` + `src/route-store.mjs`）。
+ *
+ * ⚠ 这两个模块由另一条任务线并行开发，本分支上**可能还不存在** ——
+ * 所以一律 `import(...).catch(() => null)`：缺失就是「不探测」，绝不抛。
+ *
+ * 结果缓存到进程级：一次登录失败不该每次都重新 import 一遍。
+ * （模块被补上后要重启 magpie 才会生效 —— 重载插件会换新进程。）
+ *
+ * @type {Promise<null | {probeRoute: Function, writeRouteState?: Function}>|null}
+ */
+let routeModules = null
+
+function loadRouteModules() {
+  routeModules ??= (async () => {
+    const [probe, store] = await Promise.all([
+      import("../route.mjs").catch(() => null),
+      import("../route-store.mjs").catch(() => null),
+    ])
+    if (typeof probe?.probeRoute !== "function") return null
+    return {
+      probeRoute: probe.probeRoute,
+      writeRouteState: typeof store?.writeRouteState === "function" ? store.writeRouteState : undefined,
+    }
+  })()
+  return routeModules
+}
+
 /** 一次登录会话的中间状态（短信那条路要跨 ask/authorize 传递）。 */
 /** @type {Map<string, {phone?: string, msgid?: string}>} */
 const pending = new Map()
@@ -87,6 +115,33 @@ export function makeMethods(opts = {}) {
   const baseUrl = String(opts.baseUrl ?? DEFAULT_BASE_URL)
   const doFetch = opts.fetchImpl ?? ((...args) => globalThis.fetch(...args))
   const log = opts.log ?? console
+  // 状态文件落在 magpie 的配置目录下（index.mjs 已经把它传进来了）
+  const configDir = String(opts.configDir ?? process.env.MAGPIE_CONFIG_DIR ?? "").trim()
+
+  /**
+   * 收尾：包成 magpie 要的登录结果，并在**后台**触发补初始化 + DS4.1 路由探测。
+   *
+   * ⚠ 这里必须是同步返回的（AGENTS.md 坑 #7）：任何 `await` 都会让 magpie 的
+   * 登录界面一直转圈。补初始化与路由探测都挂在 `void` 上，失败只记 warn。
+   *
+   * @param {object} cred
+   * @returns {object} 登录结果
+   */
+  const finish = (cred) => {
+    const result = successResult(cred)
+    void afterLogin({
+      baseUrl,
+      doFetch,
+      log,
+      configDir,
+      cred,
+      // uid 取**登录结果**的 metadata：magpie 落盘用的就是它，两边必须一致，
+      // 否则面板上的 uid 与状态文件里的 uid 会对不上。
+      uid: String(result.metadata?.uid ?? cred.uid ?? ""),
+      routeModules: opts.routeModules,
+    })
+    return result
+  }
 
   /** ① 本机客户端登录态 —— 读 leveldb，零交互 */
   const localMethod = {
@@ -131,8 +186,7 @@ export function makeMethods(opts = {}) {
           } catch (e) {
             return { type: "failed", error: `读到的 session 不可用: ${e?.message ?? e}` }
           }
-          void afterLogin(baseUrl, cred, doFetch, log)
-          return successResult(cred)
+          return finish(cred)
         },
       }
     },
@@ -206,8 +260,7 @@ export function makeMethods(opts = {}) {
         pending.delete(state)
       }
 
-      void afterLogin(baseUrl, cred, doFetch, log)
-      return successResult(cred)
+      return finish(cred)
     },
   }
 
@@ -247,8 +300,7 @@ export function makeMethods(opts = {}) {
         return { type: "failed", error: String(e?.message ?? e) }
       }
 
-      void afterLogin(baseUrl, cred, doFetch, log)
-      return successResult(cred)
+      return finish(cred)
     },
   }
 
@@ -287,9 +339,9 @@ export async function verifySession(baseUrl, session, doFetch) {
 }
 
 /**
- * 登录成功后的「补初始化」：`POST /points/first-login`。
+ * 登录成功后的「补初始化」+ DS4.1 路由探测。
  *
- * # 为什么必须做（源项目里「邀请码不显示」的根因）
+ * # 首登初始化为什么必须做（源项目里「邀请码不显示」的根因）
  *
  * 客户端每次登录后会自动调它：服务端下发注册奖励（实测 5000）并
  * **生成 5 个邀请码**。而通过第三方导入的账号跳过了这一步 ——
@@ -297,14 +349,55 @@ export async function verifySession(baseUrl, session, doFetch) {
  *
  * 服务端有 `alreadyProcessed` 幂等保护，重复调用不会重复发奖。
  *
- * ⚠ 火后不管：失败只记日志，**绝不**让登录失败（账号已经拿到了）。
+ * # DS4.1 路由探测为什么也挂在这里
  *
+ * 上游对**被限制的账号**会把 `DeepSeek-V4.1-Flash` 实际落到 `spark-x2.6-low`，
+ * 而 `/models` 与 chat 响应都看不出来 —— 唯一权威信号是积分账本
+ * （`GET /points/records` 里的 `modelName`）。登录是唯一「一定有人在场」的
+ * 时刻，顺手探一次并落盘，面板打开就有结论，不必用户手动点。
+ *
+ * ⚠ 两条都**不许**影响登录（AGENTS.md 坑 #7）：本函数整体挂在 `void` 上，
+ * `finish()` 同步返回；这里再慢、再失败也只是日志。
+ *
+ * @param {{baseUrl: string, doFetch: typeof fetch, log: object, configDir: string,
+ *   cred: object, uid: string, routeModules?: object|null}} input
  * @returns {Promise<void>}
  */
-async function afterLogin(baseUrl, cred, doFetch, log) {
+async function afterLogin({ baseUrl, doFetch, log, configDir, cred, uid, routeModules: override }) {
   try {
     await firstLogin({ baseUrl, auth: { session: cred.session }, fetchImpl: doFetch })
   } catch (e) {
     log.warn?.(`loomy: 首登初始化失败（不影响登录本身）: ${e?.message ?? e}`)
+  }
+  // 再套一层 `void`：探测必须彻底脱离登录链路
+  void probeRoute({ baseUrl, doFetch, log, configDir, cred, uid, override })
+}
+
+/**
+ * 后台跑一次路由探测并把结论写状态文件。
+ *
+ * 失败只 `log.warn` —— 登录已经成功，这里没有任何理由改变结果。
+ *
+ * @param {{baseUrl: string, doFetch: typeof fetch, log: object, configDir: string,
+ *   cred: object, uid: string, override?: object|null}} input
+ * @returns {Promise<void>}
+ */
+async function probeRoute({ baseUrl, doFetch, log, configDir, cred, uid, override }) {
+  try {
+    const mods = override === undefined ? await loadRouteModules() : override
+    // 模块未就绪（并行开发期 / 未部署）：静默跳过，面板显示「未检测」
+    if (!mods?.probeRoute) return
+    const entry = await mods.probeRoute({ baseUrl, session: cred.session, fetchImpl: doFetch })
+    if (!entry || typeof entry !== "object") return
+    // `unknown` = 这次没测清。不落盘：否则一次上游抖动就会把上一次的有效结论
+    // 抹成「未检测」，用户会以为刚测的结果丢了（与 server 的落盘规则一致）。
+    if (entry.verdict === "unknown") return
+    if (!configDir) {
+      log.warn?.("loomy: 没有 configDir，DS4.1 路由结论无法落盘（不影响登录）")
+      return
+    }
+    await mods.writeRouteState?.(configDir, uid, entry)
+  } catch (e) {
+    log.warn?.(`loomy: DS4.1 路由探测失败（不影响登录）: ${e?.message ?? e}`)
   }
 }

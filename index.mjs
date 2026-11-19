@@ -97,11 +97,20 @@ export const LoomyAuthPlugin = async (input = {}, options = {}) => {
       }
     : console
 
+  // `configDir` 同时喂给四条钩子：登录态（methods）、请求（loader）、
+  // 额度窗口（usage）、模型目录（provider.models）。
+  //
+  // 它们要同一个目录，是因为「这个账号是不是被上游限制了」的判定落在
+  // `src/route-store.mjs`（按 configDir 定位的状态文件）。几处必须拿到同一个
+  // 目录，否则会出现「卡片说不能用、目录却还列着 DS4.1」这种自相矛盾。
+  //
+  // ⚠ 真正的「排除」只发生在 `provider.models`（routed ⇒ 空目录）；loader 只
+  // 记日志、usage 只加说明窗。理由写在 `src/hooks/models.mjs` 顶部。
   /** @type {any} */
   const auth = {
     provider: PROVIDER,
     methods: makeMethods({ baseUrl, log, configDir }),
-    loader: makeLoaderHook(),
+    loader: makeLoaderHook({ configDir, log }),
     usage: makeUsageHook({ baseUrl, log, configDir }),
     // 从文件批量导入（magpie 自己的钩子，OpenCode 会忽略）。
     // 装上它，供应商编辑页就会出现「从文件导入账号…」按钮。
@@ -109,6 +118,14 @@ export const LoomyAuthPlugin = async (input = {}, options = {}) => {
       // 导入时不验证 —— 上游可能只是这一刻不通，而凭证本身是对的。
       // 让账号先进池子，第一次请求失败会如实标出来。
       verify: undefined,
+      // `configDir` 有两个用途（都只在导入时用）：
+      //	① 读 `plugin-auth.json` 做去重 —— 超过 magpie 单次 100 条上限时，
+      //	   再选一次同一文件才能把剩下的导进来（不再静默丢弃）
+      //	② 导入后在后台把新号的 DS4.1 路由探测结果落盘（`void`，不阻塞导入）
+      configDir,
+      // 后台探测要打模型代理，所以基址也要一起给（用户可能改过 baseUrl）
+      baseUrl,
+      log,
     }),
   }
   if (ICON) auth.icon = ICON
@@ -118,7 +135,7 @@ export const LoomyAuthPlugin = async (input = {}, options = {}) => {
     auth,
     provider: {
       id: PROVIDER,
-      models: makeModelsHook({ baseUrl, log }),
+      models: makeModelsHook({ baseUrl, log, configDir }),
     },
   }
 }

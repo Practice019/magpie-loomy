@@ -125,3 +125,7 @@ small.error { max-width: 250px; white-space: nowrap; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; }
 }
+
+/* 危险操作（清空检测结果）：红色文字，不抢主按钮的视觉 */
+button.danger { color: var(--bad); border-color: #ef64754d; }
+button.danger:hover:not(:disabled) { background: #ef647512; }
