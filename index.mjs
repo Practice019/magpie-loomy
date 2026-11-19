@@ -110,7 +110,7 @@ export const LoomyAuthPlugin = async (input = {}, options = {}) => {
   const auth = {
     provider: PROVIDER,
     methods: makeMethods({ baseUrl, log, configDir }),
-    loader: makeLoaderHook({ configDir, log }),
+    loader: makeLoaderHook({ configDir, log, bodyMode: options?.bodyMode }),
     usage: makeUsageHook({ baseUrl, log, configDir }),
     // 从文件批量导入（magpie 自己的钩子，OpenCode 会忽略）。
     // 装上它，供应商编辑页就会出现「从文件导入账号…」按钮。
@@ -193,6 +193,16 @@ export const LoomyPage = async (input = {}, options = {}) => {
  * 测试与排障用的内部引用。
  *
  * ⚠ 挂在一个对象上，不要散着导出 —— 入口的每个具名导出都会被当成插件调用。
+ *
+ * # 关于 `bodyMode`（用户可见的插件选项）
+ *
+ * `LoomyAuthPlugin` 把 `options.bodyMode` 原样传给 `makeLoaderHook`，可选值：
+ *
+ *	"passthrough"（**默认**）  body 逐字节原样发 —— 用户明确要求「原始 BODY 一模一样」
+ *	"default"                 走 `prepareBody`：补 `stream=true` + `stream_options.include_usage`
+ *
+ * ⚠ 默认是 passthrough 的代价：调用方 body 若没有 `stream:true`，magpie 网关拿不到
+ *   流式响应，非流式转码可能失败。要改写就在插件选项里填 `"bodyMode": "default"`。
  */
 export const _internal = {
   PROVIDER,

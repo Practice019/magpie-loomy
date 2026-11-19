@@ -26,7 +26,14 @@
 // 复用 `route.mjs` 导出的 `readLedgerRecords` —— 它内部走同一个
 // `MAX_LEDGER_CONCURRENCY = 2` 信号量。批量巡检因此不会把多副本账本打得更旧。
 
-import { DS41_MODEL_ID, inspectBalance, inspectCatalog, readLedgerRecords } from "./route.mjs"
+import {
+  DS41_MODEL_ID,
+  classifyLedgerModel,
+  inspectBalance,
+  inspectCatalog,
+  readLatestLedgerRecord,
+  readLedgerRecords,
+} from "./route.mjs"
 
 /** 流量回溯窗口：只看最近 7 天的真实请求。 */
 const TRAFFIC_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
@@ -55,9 +62,9 @@ let trafficModule
  * @param {typeof fetch} [opts.fetchImpl] 注入的 fetch（测试用）
  * @param {number} [opts.now] 当前时间（毫秒；测试注入固定时钟）
  * @param {Array<{model: string, at: number}>} [opts.traffic] 注入流量（测试用；省略则读 traffic.mjs）
- * @returns {Promise<{verdict?: "routed"|"clean"|"expired"|"unknown", reason?: string,
+ * @returns {Promise<{verdict?: "routed"|"clean"|"expired"|"exhausted"|"unknown", reason?: string,
  *   servedModel?: string, checkedAt?: number, catalogOkAt?: number,
- *   trafficChecked?: number, keep?: true, error?: string}>}
+ *   trafficChecked?: number, keep?: true, rateLimited?: true, error?: string}>}
  */
 export async function patrolAccount({
   baseUrl,
@@ -85,6 +92,11 @@ export async function patrolAccount({
 
   if (catalog.status === "unavailable") {
     // 读不到目录 ≠ 账号有问题：keep，并记 catalogOkAt=0 让上层知道这次没读到。
+    // ⚠ 429 单独标出来：面板要能说「检测被限流，稍后重试」，而不是
+    //   「这个号有问题」。已判定的结论照旧保留（keep 语义本身就是「不覆盖」）。
+    // 只在真是 429 时才带该字段 —— 多一个 `rateLimited: false` 会让下游
+    // 误以为「这次查过、结论是不限流」。
+    if (catalog.rateLimited === true) return { keep: true, catalogOkAt: 0, rateLimited: true }
     return { keep: true, catalogOkAt: 0 }
   }
 
@@ -125,7 +137,63 @@ export async function patrolAccount({
     }
   }
 
-  // ── ③ 真实流量：找最近的请求与账本记录比对 -----------------------------
+  // ── ③ 账本硬证据：最新一条 modelName（优先于流量比对） ─────────────────
+  //
+  // 账本本身就是直接答案：该号最近一次真实调用的 `modelName` 是什么。
+  // 这比「traffic 时间戳 ↔ 账本时间戳」对账硬得多 —— 用户直接用客户端
+  // 测试时不会产生 traffic，但对账本照样有记录。实测号 16532460196：
+  // 15 次直测全部记成 spark-x2.6-low，旧实现却因为没有 traffic 命中判 clean。
+  //
+  // 只有「账本一条记录都没有」时才继续走 traffic 窗口比对，不要跳过它。
+  let latest
+  try {
+    latest = await readLatestLedgerRecord({ baseUrl, session, fetchImpl, reads: 1 })
+  } catch (e) {
+    // 限流（429）：这条链路的证据不完整 → keep，别把限流判成账号问题。
+    if (e?.rateLimited) return { keep: true, catalogOkAt: now, rateLimited: true }
+    const why = errorText(e)
+    const disabled =
+      /100003/.test(why) &&
+      ["停用", "禁用", "封禁", "已关闭"].some((marker) => why.includes(marker))
+    if (disabled) {
+      return {
+        verdict: "expired",
+        reason: "account-disabled",
+        servedModel: "（账号已停用）",
+        checkedAt: now,
+        catalogOkAt: now,
+      }
+    }
+    if (/100003/.test(why) || /100002/.test(why) || /登录已失效/.test(why)) {
+      return {
+        verdict: "expired",
+        reason: "session-expired",
+        servedModel: "（登录已失效）",
+        checkedAt: now,
+        catalogOkAt: now,
+      }
+    }
+    // 其它失败（含 5xx / 网络）：读不到 ≠ 没有记录，保留原结论。
+    return { keep: true, catalogOkAt: now }
+  }
+
+  if (latest.record) {
+    const decision = classifyLedgerModel(latest.record.modelName)
+    if (decision) {
+      const createdAt = Number(latest.record.createdAt)
+      return {
+        verdict: decision.verdict,
+        reason: decision.reason,
+        servedModel: decision.servedModel,
+        checkedAt: now,
+        catalogOkAt: now,
+        ledgerId: String(latest.record.ledgerId ?? ""),
+        ledgerAgeSec: Number.isFinite(createdAt) ? Math.max(0, now / 1000 - createdAt) : 0,
+      }
+    }
+  }
+
+  // ── ④ 真实流量：账本没有记录时，用 traffic 窗口对账 -------------------
   const samples = await loadTrafficSamples({ configDir, uid, now, traffic })
   if (samples.length === 0) {
     return { keep: true, catalogOkAt: now, trafficChecked: 0 }
@@ -136,6 +204,8 @@ export async function patrolAccount({
   /** @type {any|null} */
   let match = null
   let checked = 0
+  // 账本读取被限流（429）：这条链路的证据就不完整，上层应当 keep
+  let rateLimited = false
 
   for (const sample of samples) {
     if (!sample || !sample.model) continue
@@ -149,8 +219,10 @@ export async function patrolAccount({
     let records
     try {
       records = await readLedgerRecords({ baseUrl, session, fetchImpl })
-    } catch {
-      // 账本偶发失败：这条跳过，不当成「对不上」。
+    } catch (e) {
+      // 账本偶发失败 / 限流（429）：这条跳过，不当成「对不上」。
+      // 限流时上层也应当 keep —— 记下来，别让一次限流把 clean 判成别的东西。
+      if (e?.rateLimited) rateLimited = true
       continue
     }
 
@@ -199,6 +271,9 @@ export async function patrolAccount({
     }
   }
   // 全部对不上：不降级、不升级，只保留「目录这次是好的」。
+  // ⚠ 但若中途吃过 429，这次的「没对上」很可能只是限流导致的抽样缺失，
+  //   必须如实带上 rateLimited，让面板说「稍后重试」而不是「换个号吧」。
+  if (rateLimited) return { keep: true, catalogOkAt: now, trafficChecked: checked, rateLimited: true }
   return { keep: true, catalogOkAt: now, trafficChecked: checked }
 }
 

@@ -140,8 +140,14 @@ export async function probeRoute({
     sleep,
   })
 
+  // probeRoute 的契约里 verdict 永远存在；内部 keep（这次没结论）翻译成 unknown，
+  // 但保留 reason（no-ledger-records）说明是「没读到 / 没有记录」，不是「判正常」。
+  const keep = verdict.keep === true
+  const { keep: _keep, ...rest } = verdict
+
   return {
-    ...verdict,
+    ...rest,
+    verdict: keep ? "unknown" : verdict.verdict,
     requested: DS41_MODEL_ID,
     responseModel: "",
     // ⚠ 保留该字段恒为空：旧调用方/面板按它拼日志，删字段会让它们显示 undefined。
@@ -232,73 +238,39 @@ export async function evaluateReadOnly({
   }
 
   // ── ③ 账本最新记录（取 createdAt 最大的一条） ─────────────────────────
-  /** @type {any|null} */
-  let record = null
-  let sawReply = false
-
-  for (let i = 0; i < reads; i++) {
-    // 预检立刻读，之后才等间隔。
-    if (i > 0) await wait(interval)
-
-    /** @type {any[]} */
-    let list
-    try {
-      list = await readLedgerPage({ baseUrl: root, session, fetchImpl: doFetch })
-      sawReply = true
-    } catch {
-      continue
-    }
-
-    const first = Array.isArray(list) ? list[0] : null
-    const at = Number(first?.createdAt)
-    if (!first || !Number.isFinite(at)) continue
-    if (!record || at > Number(record.createdAt)) record = first
+  let ledger
+  try {
+    ledger = await readLatestLedgerRecord({
+      baseUrl: root,
+      session,
+      fetchImpl: doFetch,
+      reads,
+      intervalMs: interval,
+      sleep: wait,
+    })
+  } catch {
+    // 账本一次都没读通：读不到 ≠ 没有记录，交给调用方保留原状态。
+    return result({ keep: true, reason: "no-ledger-records", evidence: { ledgerModelName: "", catalog: catalogEvidence } })
   }
 
+  const record = ledger.record
   const ledgerModelName = String(record?.modelName ?? "").trim()
-  const lowered = ledgerModelName.toLowerCase()
-  const ledgerId = String(record?.ledgerId ?? "")
 
-  if (ledgerModelName) {
-    const evidence = { ledgerModelName, catalog: catalogEvidence }
-    if (lowered.startsWith("spark")) {
-      return result({
-        verdict: "routed",
-        reason: "ledger-spark",
-        servedModel: ledgerModelName,
-        createdAt: Number(record.createdAt),
-        ledgerId,
-        ledgerAgeSec: ledgerAge(checkedAt, record.createdAt),
-        evidence,
-      })
-    }
-    if (lowered.startsWith("deepseek")) {
-      return result({
-        verdict: "clean",
-        reason: "ledger-deepseek",
-        servedModel: ledgerModelName,
-        createdAt: Number(record.createdAt),
-        ledgerId,
-        ledgerAgeSec: ledgerAge(checkedAt, record.createdAt),
-        evidence,
-      })
-    }
-    // 请求 DS4.1 却记到别家（glm / qwen / mimo…）= 请求被换模型，账号不可信。
+  const verdict = ledgerModelName ? classifyLedgerModel(ledgerModelName) : null
+  if (verdict) {
     return result({
-      verdict: "routed",
-      reason: "ledger-other-family",
-      servedModel: ledgerModelName,
-      createdAt: Number(record.createdAt),
-      ledgerId,
-      ledgerAgeSec: ledgerAge(checkedAt, record.createdAt),
-      evidence,
+      verdict: verdict.verdict,
+      reason: verdict.reason,
+      servedModel: verdict.servedModel,
+      createdAt: Number(record?.createdAt) || 0,
+      ledgerId: String(record?.ledgerId ?? ""),
+      ledgerAgeSec: ledgerAge(checkedAt, record?.createdAt),
+      evidence: { ledgerModelName, catalog: catalogEvidence },
     })
   }
 
-  // 目录可读、余额也够，但账本一条像样的记录都没有：
-  //   · 账本一次都没读通 → keep（读不到 ≠ 没有记录）
-  //   · 读通了但确实空 → no-ledger-records（新号，等真实流量）
-  if (!sawReply) {
+  // 账本读通了但一条像样的记录都没有：新号，等真实流量（配合 traffic / patrol）。
+  if (!ledger.sawReply) {
     return result({ keep: true, reason: "no-ledger-records", evidence: { ledgerModelName: "", catalog: catalogEvidence } })
   }
   return result({
@@ -306,6 +278,78 @@ export async function evaluateReadOnly({
     reason: "no-ledger-records",
     evidence: { ledgerModelName: "", catalog: catalogEvidence },
   })
+}
+
+/**
+ * 账本记录 → 判定（**唯一实现**，probeRoute / patrol 共用）。
+ *
+ * 「非 deepseek 族」为什么算 routed：请求的是 DS4.1，账本却记到 GLM / Qwen /
+ * MiMo……，这本身就是「请求被换成了别家的模型」，与 spark 同性质。
+ *
+ * @param {string} modelName
+ * @returns {{verdict: "routed"|"clean", reason: string, servedModel: string}|null}
+ */
+export function classifyLedgerModel(modelName) {
+  const name = String(modelName ?? "").trim()
+  if (!name) return null
+  const low = name.toLowerCase()
+  if (low.startsWith("spark")) return { verdict: "routed", reason: "ledger-spark", servedModel: name }
+  if (low.startsWith("deepseek")) return { verdict: "clean", reason: "ledger-deepseek", servedModel: name }
+  return { verdict: "routed", reason: "ledger-other-family", servedModel: name }
+}
+
+/**
+ * 读账本最新记录（取 `createdAt` 最大的那条）。
+ *
+ * 每次读只取 `list[0]`（副本内最新在前）；多次读取是为了撞上更新的副本。
+ * 全部读取失败时**抛错**（让调用方区分「读不到」与「确实空」）；读通但空
+ * 返回 `{record:null, sawReply:true}`。
+ *
+ * @param {{baseUrl: string, session: string, fetchImpl?: typeof fetch,
+ *   reads?: number, intervalMs?: number, sleep?: (ms: number) => Promise<void>}} opts
+ * @returns {Promise<{record: any|null, sawReply: boolean}>}
+ */
+export async function readLatestLedgerRecord({
+  baseUrl,
+  session,
+  fetchImpl,
+  reads = 1,
+  intervalMs = 0,
+  sleep,
+} = {}) {
+  const root = String(baseUrl ?? "").replace(/\/+$/, "")
+  const doFetch = fetchImpl ?? ((...args) => globalThis.fetch(...args))
+  const wait = typeof sleep === "function" ? sleep : defaultSleep
+  const total = Math.max(1, Math.floor(Number(reads) || 1))
+  const interval = Math.max(0, Number(intervalMs) || 0)
+
+  /** @type {any|null} */
+  let newest = null
+  let sawReply = false
+  /** @type {unknown} */
+  let lastError = null
+
+  for (let i = 0; i < total; i++) {
+    if (i > 0) await wait(interval)
+
+    /** @type {any[]} */
+    let list
+    try {
+      list = await readLedgerPage({ baseUrl: root, session, fetchImpl: doFetch })
+      sawReply = true
+    } catch (e) {
+      lastError = e
+      continue
+    }
+
+    const first = Array.isArray(list) ? list[0] : null
+    const at = Number(first?.createdAt)
+    if (!first || !Number.isFinite(at)) continue
+    if (!newest || at > Number(newest.createdAt)) newest = first
+  }
+
+  if (!newest && !sawReply && lastError) throw lastError
+  return { record: newest, sawReply }
 }
 
 // ── 内部 ────────────────────────────────────────────────────────────────
@@ -319,7 +363,7 @@ export async function evaluateReadOnly({
  *
  * @param {{root: string, session: string, fetchImpl: typeof fetch}} opts
  * @returns {Promise<{status: "expired"|"ok"|"unavailable", ids: string[],
- *   reason: "session-expired"|"account-disabled"|""}>}
+ *   reason: "session-expired"|"account-disabled"|"", rateLimited?: true}>}
  */
 async function readCatalog({ root, session, fetchImpl }) {
   const headers = new Headers({ Accept: "application/json" })
@@ -342,6 +386,11 @@ async function readCatalog({ root, session, fetchImpl }) {
   // 401/403 是明确的「凭证死了」。其它非 2xx（含 5xx）只是读不到目录。
   if (resp.status === 401 || resp.status === 403) {
     return { status: "expired", ids: [], reason: "session-expired" }
+  }
+  // ⚠ 429 = 瞬时限流，**不是**账号问题（真机实测：限流期间 /models 仍会说
+  // 自己有 DS4.1）。单独标出来，让巡检「保留原结论」而不是判死。
+  if (resp.status === 429) {
+    return { status: "unavailable", ids: [], reason: "", rateLimited: true }
   }
   if (!resp.ok) return { status: "unavailable", ids: [], reason: "" }
 
@@ -537,9 +586,12 @@ export function modelFamilyOf(model) {
 /**
  * 目录巡检结果（与 `probeRoute` 同一套规则）。
  *
+ * ⚠ `rateLimited: true` 表示**这次被限流**（429）。它是一条「没有结论」的
+ * 信号，调用方必须 keep（保留上一次的判定），绝不能当成 expired/routed。
+ *
  * @param {{baseUrl: string, session: string, fetchImpl?: typeof fetch}} opts
  * @returns {Promise<{status: "expired"|"ok"|"unavailable", ids: string[],
- *   reason: "session-expired"|"account-disabled"|""}>}
+ *   reason: "session-expired"|"account-disabled"|"", rateLimited?: true}>}
  */
 export async function inspectCatalog({ baseUrl, session, fetchImpl }) {
   const root = String(baseUrl ?? "").replace(/\/+$/, "")

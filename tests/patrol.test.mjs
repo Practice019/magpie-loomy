@@ -110,7 +110,7 @@ test("目录只有 spark → routed / catalog-missing-ds41，0 次 chat", async 
   assert.equal(fetchImpl.calls.chat.length, 0)
 })
 
-test("真实流量请求 DS4.1，账本记 spark-x2.6-low → routed / traffic-mismatch", async () => {
+test("账本最新记 spark-x2.6-low → routed / ledger-spark（即使 traffic 为空，硬证据优先）", async () => {
   const fetchImpl = upstream({
     ledgerPages: [[{ createdAt: Math.floor(AT / 1000), modelName: "spark-x2.6-low", ledgerId: "L-1" }]],
   })
@@ -122,16 +122,16 @@ test("真实流量请求 DS4.1，账本记 spark-x2.6-low → routed / traffic-m
     configDir: "",
     fetchImpl,
     now: NOW,
-    traffic: trafficFor(DS41_MODEL_ID),
+    traffic: [],
   })
 
   assert.equal(r.verdict, "routed")
-  assert.equal(r.reason, "traffic-mismatch")
+  assert.equal(r.reason, "ledger-spark")
   assert.equal(r.servedModel, "spark-x2.6-low")
   assert.equal(fetchImpl.calls.chat.length, 0)
 })
 
-test("真实流量请求 DS4.1，账本记 deepseek-v4-flash-1017 → clean / traffic-match", async () => {
+test("账本最新记 deepseek-v4-flash-1017 → clean / ledger-deepseek", async () => {
   const fetchImpl = upstream({
     ledgerPages: [[{ createdAt: Math.floor(AT / 1000), modelName: "deepseek-v4-flash-1017", ledgerId: "L-2" }]],
   })
@@ -147,12 +147,70 @@ test("真实流量请求 DS4.1，账本记 deepseek-v4-flash-1017 → clean / tr
   })
 
   assert.equal(r.verdict, "clean")
-  assert.equal(r.reason, "traffic-match")
+  assert.equal(r.reason, "ledger-deepseek")
   assert.equal(r.servedModel, "deepseek-v4-flash-1017")
   assert.equal(fetchImpl.calls.chat.length, 0)
 })
 
-test("没有 traffic → keep，不改 verdict，也不读账本", async () => {
+test("账本最新记 GLM-5.3-Flash → routed / ledger-other-family", async () => {
+  const fetchImpl = upstream({
+    ledgerPages: [[{ createdAt: Math.floor(AT / 1000), modelName: "GLM-5.3-Flash", ledgerId: "L-3" }]],
+  })
+
+  const r = await patrolAccount({
+    baseUrl: BASE,
+    session: SESSION,
+    uid: "u1",
+    configDir: "",
+    fetchImpl,
+    now: NOW,
+    traffic: [],
+  })
+
+  assert.equal(r.verdict, "routed")
+  assert.equal(r.reason, "ledger-other-family")
+  assert.equal(r.servedModel, "GLM-5.3-Flash")
+})
+
+test("真实流量请求 DS4.1，账本记 spark-x2.6-low → 由账本硬证据判 routed / ledger-spark", async () => {
+  const fetchImpl = upstream({
+    ledgerPages: [[{ createdAt: Math.floor(AT / 1000), modelName: "spark-x2.6-low", ledgerId: "L-1" }]],
+  })
+
+  const r = await patrolAccount({
+    baseUrl: BASE,
+    session: SESSION,
+    uid: "u1",
+    configDir: "",
+    fetchImpl,
+    now: NOW,
+    traffic: trafficFor(DS41_MODEL_ID),
+  })
+
+  assert.equal(r.verdict, "routed")
+  assert.equal(r.reason, "ledger-spark", "账本记录优先于 traffic 窗口对账")
+  assert.equal(r.servedModel, "spark-x2.6-low")
+  assert.equal(fetchImpl.calls.chat.length, 0)
+})
+
+test("账本空 + traffic 请求 DS4.1 + 账本仍无对应记录 → keep（不清白也不定罪）", async () => {
+  const fetchImpl = upstream({ ledgerPages: [[]] })
+
+  const r = await patrolAccount({
+    baseUrl: BASE,
+    session: SESSION,
+    uid: "u1",
+    configDir: "",
+    fetchImpl,
+    now: NOW,
+    traffic: trafficFor(DS41_MODEL_ID),
+  })
+
+  assert.equal(r.keep, true)
+  assert.equal("verdict" in r, false)
+})
+
+test("账本空 + 没有 traffic → keep，不改 verdict", async () => {
   const fetchImpl = upstream()
 
   const r = await patrolAccount({
@@ -167,8 +225,32 @@ test("没有 traffic → keep，不改 verdict，也不读账本", async () => {
 
   assert.deepEqual(r, { keep: true, catalogOkAt: NOW, trafficChecked: 0 })
   assert.equal("verdict" in r, false)
-  // 账本只被读了 1 次（余额），没有读记录。
-  assert.equal(fetchImpl.calls.ledger.length, 1)
+  // 余额 1 次 + 账本记录 1 次（硬证据那步），没有为 traffic 再读。
+  assert.equal(fetchImpl.calls.ledger.length, 2)
+})
+
+test("账本读记录 429 → keep，不判死", async () => {
+  const fetchImpl = async (url, init) => {
+    const href = String(url)
+    if (href.endsWith("/models")) return jsonResponse({ data: [{ id: DS41_MODEL_ID }] })
+    if (/pageSize=1$/.test(href)) return jsonResponse(envelope([], { availableBalance: 34900 }))
+    if (href.includes("/points/records")) return jsonResponse({ code: "FAIL" }, 429)
+    throw new Error(`unexpected request: ${href}`)
+  }
+
+  const r = await patrolAccount({
+    baseUrl: BASE,
+    session: SESSION,
+    uid: "u1",
+    configDir: "",
+    fetchImpl,
+    now: NOW,
+    traffic: trafficFor(DS41_MODEL_ID),
+  })
+
+  assert.equal(r.keep, true)
+  assert.equal(r.rateLimited, true)
+  assert.equal("verdict" in r, false)
 })
 
 test("目录 500 → keep，不判", async () => {
@@ -208,7 +290,7 @@ test("traffic 3 条但账本都找不到对应记录 → keep", async () => {
 
   assert.equal(r.keep, true)
   assert.equal("verdict" in r, false)
-  assert.equal(fetchImpl.calls.ledger.length, 4, "余额 1 次 + 每条流量各查一次账本")
+  assert.equal(fetchImpl.calls.ledger.length, 5, "余额 1 + 硬证据 1 + 每条流量各 1 次")
 })
 
 test("全流程 0 次 chat/completions", async () => {

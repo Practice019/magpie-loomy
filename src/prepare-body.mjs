@@ -14,7 +14,22 @@
 // 本函数的职责是「优化」，不是「校验」。在这里造一个错误，等于把一个
 // 上游能诊断的问题变成一个我们自己编的问题。
 
-import { maxOutputFor } from "./models.mjs"
+// ⚠ 不再 import `maxOutputFor`：既然不裁剪，就不需要模型上限。
+
+/**
+ * 客户端对话请求的固定输出上限（抓包实证）。
+ *
+ * ⚠ 仅**导出供面板/文档引用**：用户明确要求「原始 body 一模一样」，
+ * 所以 `prepareBody` **不再**用它裁剪、也不再补默认值。
+ */
+export const CLIENT_CHAT_MAX_TOKENS = 32_000
+
+/**
+ * 客户端固定的推理强度（抓包实证）。
+ *
+ * ⚠ 同上：仅导出备查，`prepareBody` 不再注入。
+ */
+export const CLIENT_REASONING_EFFORT = "high"
 
 /**
  * 在出站前改写请求体。
@@ -38,33 +53,49 @@ export function prepareBody(body) {
 
   obj.stream = true
 
-  const model = typeof obj.model === "string" ? obj.model : ""
-  const limit = model ? maxOutputFor(model) : 0
-  if (limit > 0) {
-    clampTokenField(obj, "max_tokens", limit)
-    clampTokenField(obj, "max_completion_tokens", limit)
+  // ── 与客户端 1:1：`stream_options.include_usage` ──
+  //
+  // 客户端走 AI SDK 流式请求，会带 `stream_options: { include_usage: true }`。
+  // 缺了它上游不在流里给 usage 帧，「这次花了多少」就缺一块。
+  //
+  // ⚠ 三条边界：
+  //	① 只在流式时补（本函数已经强制 stream=true，所以就在下面）
+  //	② `stream_options` 是字符串 / 数组时**不动** —— 那是上游该诊断的形态
+  //	③ 调用方显式写了 `include_usage: false` 就尊重它，别改成 true
+  if (obj.stream === true) {
+    if (obj.stream_options === undefined) {
+      obj.stream_options = { include_usage: true }
+    } else if (
+      obj.stream_options &&
+      typeof obj.stream_options === "object" &&
+      !Array.isArray(obj.stream_options) &&
+      obj.stream_options.include_usage === undefined
+    ) {
+      obj.stream_options.include_usage = true
+    }
   }
+
+  // ── ⚠ 这里**不再**裁剪或补默认值（用户明确要求：原始 body 一模一样）──
+  //
+  // 历史：曾把 `max_tokens` 裁到 32000、给 `reasoning_effort` 补 `"high"`，
+  // 依据是「客户端就是这么发的」。但用户的原话是：
+  //
+  //	「为什么要自己裁剪呢？我就是要原始的 BODY 一模一样。」
+  //
+  // 所以现在只做两件 magpie 与上游**必要**的改写：
+  //	① `stream = true`    —— magpie 网关要把流按客户端要求重新编码，非流式拿不到
+  //	② `stream_options`   —— 客户端也带；缺了流里就没有 usage 帧
+  //
+  // `max_tokens` / `max_completion_tokens` / `reasoning_effort`：**调用方给多少
+  // 就发多少，没给就不加**。`messages` / `tools` / `tool_choice` 依旧一字不动。
+  //
+  // 需要「连这两处也不改」的极端验证，用 `makeLoaderHook({ bodyMode: "passthrough" })`。
 
   try {
     return JSON.stringify(obj)
   } catch {
     return body
   }
-}
-
-/**
- * 把 obj[key] 夹到 limit 以内（只在它确实超限时才动）。
- *
- * 只在超限时改写：未超限时保留原始值，避免「每次请求都重写一遍数字」
- * 这种无意义的差异。
- *
- * ⚠ 非数字（字符串、null）不动：那是上游该诊断的形态，不是我们该纠正的。
- */
-function clampTokenField(obj, key, limit) {
-  const v = obj[key]
-  if (typeof v !== "number" || !Number.isFinite(v)) return
-  if (v <= limit) return
-  obj[key] = limit
 }
 
 /**

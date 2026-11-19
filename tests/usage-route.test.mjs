@@ -140,18 +140,23 @@ test("routed 账号：出现 aside 的说明窗，且写清实际由谁服务", 
   assert.match(String(reason.display), /spark-x2\.6-low/)
 })
 
-test("⚠ 不许伪造满额：返回里不存在 used === 100 的窗口", async () => {
+// ⚠ 第十九轮：routed 现在**故意**有一条 used:100 的停派窗（那不是「伪造额度」，
+// 而是「立刻停派」的表达）。这里改为钉真正该守的语义：**真实额度窗不许被伪造**。
+test("routed：不伪造「积分不足」额度窗；真实额度窗仍是真实值", async () => {
   const u = await usageWith({ state: { [UID]: ROUTED } })
-  const fakeFull = (u.windows ?? []).filter((w) => w?.used === 100)
-  assert.deepEqual(fakeFull, [], "报 100% 会让卡片显示「剩余 0」，用户以为号没额度了")
-  assert.equal(reasonWindow(u.windows)?.used, undefined)
+  const fakeBroke = (u.windows ?? []).filter((w) => w?.used === 100 && String(w?.name ?? "").includes("积分不足"))
+  assert.deepEqual(fakeBroke, [], "余额明明有值，不许报「积分不足」")
+  assert.equal(reasonWindow(u.windows)?.used, undefined, "说明窗本身不参与路由")
+
+  const daily = u.windows.find((w) => String(w.name).startsWith("每日赠送"))
+  assert.notEqual(daily.used, 100, "真实额度窗保留真实值，不许被改成 100")
 })
 
 test("顶层无 error，原额度窗口一个不少且不被改写", async () => {
   const u = await usageWith({ state: { [UID]: ROUTED } })
 
   assert.equal(u.error, undefined, "路由状态是附加信息，不是错误")
-  assert.equal(u.windows.length, 4, "3 个原窗口 + 1 条说明窗")
+  assert.equal(u.windows.length, 5, "3 个原窗口 + 1 条停派满额窗 + 1 条说明窗")
   for (const name of ["每日赠送", "永久积分", "可用总额"]) {
     assert.ok(u.windows.some((w) => String(w.name).startsWith(name)), `${name} 不能消失`)
   }
@@ -160,9 +165,11 @@ test("顶层无 error，原额度窗口一个不少且不被改写", async () =>
   assert.equal(daily.aside, undefined, "原窗口不许被改成 aside")
 })
 
-test("说明窗排在最前（用户先看到「这个号不能用」）", async () => {
+test("停派满额窗排最前，说明窗紧随其后（用户先看到「这个号不能用」）", async () => {
   const u = await usageWith({ state: { [UID]: ROUTED } })
-  assert.equal(u.windows[0], reasonWindow([u.windows[0]]))
+  assert.equal(u.windows[0].used, 100)
+  assert.match(String(u.windows[0].name), /上游改路由/)
+  assert.equal(u.windows[1], reasonWindow([u.windows[1]]))
 })
 
 test("clean / unknown / 无判定 / 模块缺失：一条窗口都不多加", async () => {
@@ -211,6 +218,62 @@ test("clean / unknown / 无判定：稳态都不许出现 signIn", async () => {
     const u = await usageSteady(args)
     assert.equal(u.signIn, undefined, `不该标过期: ${JSON.stringify(args)}`)
   }
+})
+
+// ── routed 立刻停派：满额窗 + 说明窗并存 ────────────────────────────────
+//
+// 真机痛点：`provider.models` 是列表缓存 —— 判定翻成 routed 之后，要等下一次
+// 重拉列表才不派活，中间仍会继续把请求给它。`auth.usage` 是**每次读都生效**的，
+// 所以在 routed 时补一条**可计入路由**的满额窗，下一次 usage 就跳过它。
+
+/** 判据：「上游改路由」那条可计入路由的满额窗。 */
+function routedStopWindow(windows) {
+  return (windows ?? []).find(
+    (w) =>
+      w?.used === 100 &&
+      w?.aside !== true &&
+      w?.limit === undefined &&
+      w?.amount === undefined &&
+      String(w?.name ?? "").includes("上游改路由"),
+  )
+}
+
+test("routed：既有 aside 说明窗，又有「上游改路由」满额窗（立刻停派）", async () => {
+  const u = await usageSteady({ state: { [UID]: ROUTED } })
+
+  const stop = routedStopWindow(u.windows)
+  assert.ok(stop, `缺「上游改路由」满额窗，实际: ${JSON.stringify(u.windows)}`)
+  assert.equal(stop.used, 100, "满额才会被路由跳过")
+  assert.equal(stop.aside, undefined, "aside 会被 allowanceOf 整条跳过 —— 那就白报了")
+  assert.equal(stop.limit, undefined)
+  assert.equal(stop.amount, undefined)
+  assert.match(String(stop.display), /spark-x2\.6-low/, "写清实际由谁服务")
+
+  assert.ok(reasonWindow(u.windows), "aside 说明窗要保留（卡片上解释原因）")
+})
+
+test("clean：不出现「上游改路由」满额窗", async () => {
+  const u = await usageSteady({ state: { [UID]: CLEAN } })
+  assert.equal(routedStopWindow(u.windows), undefined)
+})
+
+test("exhausted 与 routed 互斥：只出现「积分不足」满额窗", async () => {
+  const u = await usageSteady({ state: { [UID]: EXHAUSTED } })
+  assert.equal(routedStopWindow(u.windows), undefined, "exhausted 不该报「上游改路由」")
+
+  const broke = (u.windows ?? []).filter((w) => w?.used === 100 && String(w?.name ?? "").includes("积分不足"))
+  assert.equal(broke.length, 1)
+})
+
+test("routed：原额度窗口内容不被改写，顶层无 error", async () => {
+  const u = await usageSteady({ state: { [UID]: ROUTED } })
+
+  assert.equal(u.error, undefined)
+  const daily = u.windows.find((w) => String(w.name).startsWith("每日赠送"))
+  assert.equal(typeof daily.used, "number")
+  assert.equal(daily.used, 71.32, "原窗口的 used 必须还是真实值")
+  assert.ok(u.windows.some((w) => String(w.name).startsWith("永久积分")))
+  assert.ok(u.windows.some((w) => String(w.name).startsWith("可用总额")))
 })
 
 // ── exhausted（积分不足）：只说明原因，不碰登录态 ──────────────────────

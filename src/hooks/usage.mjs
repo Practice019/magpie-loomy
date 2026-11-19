@@ -14,7 +14,7 @@
 import { fetchPointsSnapshot, fetchTasks } from "../points.mjs"
 import { usageFromPoints, tasksSummary } from "../usage.mjs"
 import { readLocalPoints, defaultClientStoreDir } from "../client-store.mjs"
-import { accountKeys, accountRoute } from "./loader.mjs"
+import { accountKeys, accountRoute, cooldownOf } from "./loader.mjs"
 
 /**
  * 构建 `auth.usage` 钩子。
@@ -30,6 +30,8 @@ export function makeUsageHook(opts) {
   const log = opts.log ?? console
   const configDir = String(opts.configDir ?? "").trim()
   const storeOpt = opts.routeStore
+  // 冷却判断是「逻辑时间」上的事：测试注入固定时钟即可
+  const now = typeof opts.now === "function" ? opts.now : () => Date.now()
 
   /**
    * magpie 原生的「该账号需要重新登录」字段。
@@ -262,6 +264,15 @@ export function makeUsageHook(opts) {
         /* 日志失败不是业务失败 */
       }
       notes.push({ name: "上游限制 · 整号停用", aside: true, display: `全部模型实际由 ${served} 服务` })
+      // ── **立刻停派**：可计入路由的满额窗 ──
+      //
+      // 真机痛点：`provider.models` 是列表缓存 —— 判定翻成 routed 之后要等下一次
+      // 重拉列表才不派活，中间仍会把请求给它。`auth.usage` 每次读都生效，所以这里
+      // 补一条 `used:100` 的满额窗：下一次读 usage，路由就跳过这个号。
+      //
+      // ⚠ 不是 aside（aside 会被 allowanceOf 整条跳过）；也不要 amount/limit
+      //   （那会被反算成百分比）。说明窗照旧保留，用于卡片上解释原因。
+      head.push({ name: "上游改路由 · 已停用", used: 100, display: `实际由 ${served} 服务` })
     } else if (isExhausted) {
       notes.push({ name: "积分不足 · 已停用", aside: true, display: "团队积分余额不足，充值后自动恢复" })
     }
@@ -275,6 +286,30 @@ export function makeUsageHook(opts) {
         } catch {
           /* 日志失败不是业务失败 */
         }
+      }
+    }
+
+    // ── 429 冷却：短暂避开，**到期自动恢复** ──
+    //
+    // 429 不是封号（真机实测：连打 10 次里 4 次 429，之后 /models 仍正常）。
+    // 既不能永久跳过（那等于把好号封了），也不能什么都不做（宿主会立刻重试，
+    // 限流雪上加霜）。所以给一条**带 `resetsAt`** 的满额窗：magpie 到期自动恢复。
+    //
+    // ⚠ 必须 `used:100` 且**不带** `aside`（aside 会被 allowanceOf 整条跳过）。
+    // ⚠ 冷却记录在 loader 进程内存里，到期即失效 —— 不需要外部清理。
+    const cooling = cooldownOf(key, now())
+    if (cooling) {
+      const seconds = Math.max(1, Math.round((cooling.until - now()) / 1000))
+      head.push({
+        name: "限流冷却",
+        used: 100,
+        display: `上游限流，约 ${seconds} 秒后恢复`,
+        resetsAt: new Date(cooling.until).toISOString(),
+      })
+      try {
+        log?.warn?.(`loomy: 账号 ${key} 处于限流冷却（约 ${seconds}s），已报满额窗口（到期自动恢复）`)
+      } catch {
+        /* 日志失败不是业务失败 */
       }
     }
 

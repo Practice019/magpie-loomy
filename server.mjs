@@ -982,14 +982,23 @@ function ensureRouteModules(ctx) {
 
 /** 动态加载 `src/route.mjs` 与 `src/route-store.mjs`（缺失即 null）。 */
 async function loadRouteModules() {
-  const [probe, store] = await Promise.all([
+  const [probe, store, byTurn] = await Promise.all([
     import("./src/route.mjs").catch(() => null),
     import("./src/route-store.mjs").catch(() => null),
+    import("./src/byturn.mjs").catch(() => null),
   ])
   if (typeof probe?.probeRoute !== "function") return null
   if (typeof store?.readRouteState !== "function" || typeof store?.writeRouteState !== "function") return null
   return {
     probeRoute: probe.probeRoute,
+    /**
+     * 面板「检测」的默认通道：**by-turn**。
+     *
+     * 目录会谎报、账本只能猜时间窗；只有 by-turn 能说清「这一轮到底由谁服务」。
+     * 所以单行「检测」与批量检测都走它（发一条带 TurnId 的最小请求 → 回查）。
+     * `probeRoute` 保留作为一次性检查的后备。
+     */
+    probeByTurn: typeof byTurn?.probeByTurn === "function" ? byTurn.probeByTurn : undefined,
     readRouteState: store.readRouteState,
     writeRouteState: store.writeRouteState,
     getAccountRoute: store.getAccountRoute,
@@ -1404,7 +1413,12 @@ function probeAccountRoute(ctx, mods, uid, session) {
   if (inflight) return inflight
 
   const task = (async () => {
-    const entry = await mods.probeRoute({ baseUrl: ctx.baseUrl, session, fetchImpl: ctx.fetchImpl })
+    // 默认走 by-turn（唯一能说清「这一轮实际由谁服务」的通道）；
+    // 注入的测试桩若只给了 probeRoute，就退回旧的探测。
+    const entry =
+      typeof mods.probeByTurn === "function"
+        ? await mods.probeByTurn({ baseUrl: ctx.baseUrl, session, fetchImpl: ctx.fetchImpl })
+        : await mods.probeRoute({ baseUrl: ctx.baseUrl, session, fetchImpl: ctx.fetchImpl })
     if (!entry || typeof entry !== "object") throw new Error("探测模块没有返回结果")
     const kept = entry.verdict === "unknown" && hasStoredRoute(mods, ctx.configDir, uid)
     let stored = !kept

@@ -35,6 +35,84 @@ export const IMAGE_GENERATE_PATH = "/images/generations"
 /** 联网搜索（相对基址）。鉴权头：**只发** `Authorization`（实测差异）。 */
 export const SEARCH_PATH = "/search/tencent"
 
+// ── 客户端指纹（让出站请求与 Loomy 客户端一致）────────────────────────────
+//
+// # 为什么必须逐项照抄客户端
+//
+// 客户端注释（v0.9.39，`request-headers.js`）：
+//
+//	「实测 Loomy iModel 缺 traceparent 时 chat/completions 会挂死直到超时。」
+//
+// 我们过去只发 `Authorization` —— 表现就是「能用一会儿，然后卡死在超时上」。
+// 下面三项是两个事实（格式 / 固定值 / 版本号），不是风格选择：
+//
+//	① W3C traceparent：`00-<32hex>-<16hex>-<2hex>`，客户端采样位固定 `01`
+//	② 对话主链路的 purpose 固定 `chat.message`
+//	③ 客户端版本号 —— 上游可能据此开关行为，跟着客户端升级即可
+
+/** W3C traceparent 的合法形态（客户端同一条正则）。 */
+export const TRACEPARENT_PATTERN = /^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$/i
+
+/** 对话主链路固定的请求用途（客户端 `X-Loomy-Request-Purpose`）。 */
+export const REQUEST_PURPOSE_CHAT = "chat.message"
+
+/**
+ * 客户端版本号（`loomy-version` 头）。
+ *
+ * 实测来源：`_loomy_app_extract` 的 v0.9.39 安装包。上游若按版本开关行为，
+ * 必须跟着客户端升级 —— 所以它是常量而不是硬编码在调用点。
+ */
+export const DEFAULT_LOOMY_VERSION = "0.9.39"
+
+/**
+ * 客户端的 User-Agent（Electron 默认 UA）。
+ *
+ * # 为什么「换一串 UA」是必要的（抓包实证）
+ *
+ * 客户端实际调用 chat/completions 时发的 UA 是 **opencode 运行时**那一串，
+ * 不是浏览器 Chromium 串。我们过去发 Electron UA —— 形态与真客户端不符。
+ *
+ * ⚠ 三个版本号（opencode / ai-sdk / bun）要一起换，别只改一个。
+ */
+export const CLIENT_USER_AGENT = "opencode/1.14.22 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13"
+
+/**
+ * 对话端点发出的 `Accept-Encoding`（抓包实证的客户端值）。
+ *
+ * 客户端（Bun 运行时）接受 gzip/deflate/br/**zstd**；Node 的 undici 默认只有
+ * `gzip, deflate`。
+ */
+export const CLIENT_ACCEPT_ENCODING = "gzip, deflate, br, zstd"
+
+/** 对话端点发出的 `Accept`（抓包实证：客户端发的是通配符）。 */
+export const CLIENT_ACCEPT = "*/*"
+
+/**
+ * body 改写模式的默认值 —— **client-body**（用户要求「伪装成客户端」）。
+ *
+ * # 四种模式
+ *
+ *	client-body   以**抓包的完整客户端 body 为底**（`client-body-template.json`）：
+ *	              只替换 `model` 与调用方的 messages（system 追加在客户端 system 之后），
+ *	              `tools` / `tool_choice` / `max_tokens` / `reasoning_effort` /
+ *	              `$comment` / `stream_options` 全部保留模板值。
+ *	client-shape  同上思路但**按字段补**（旧实现，保留兼容）。
+ *	default       只补 `stream = true` 与 `stream_options.include_usage`。
+ *	passthrough   **完全不动** body（逐字节原样发出）——「我就是要原始的 BODY」。
+ *
+ * # 为什么默认是 client-body
+ *
+ * 实证：客户端原始 body 10/10 正常、零降级；简化 body 第 4 次就降级。
+ * 「像不像客户端」直接影响上游怎么派模型。
+ *
+ * # ⚠ 代价
+ *
+ *	client-body 会**覆盖**调用方的 tools / max_tokens 等形态字段（内容字段 messages
+ *	不受影响）。若某个 agent 依赖自定义 tools，请把它改成显式 `bodyMode: "default"`
+ *	或 `"passthrough"`。
+ */
+export const DEFAULT_BODY_MODE = "client-body"
+
 /** 读上游错误体的上限。畸形的大错误体不该把插件进程的内存吃掉。 */
 export const MAX_ERROR_BODY = 1 << 20
 

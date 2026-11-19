@@ -101,7 +101,14 @@ export async function pointsCall({ baseUrl, auth, method, path, body, fetchImpl,
     const reason = init.signal.aborted ? (timeout.aborted ? "请求超时（30秒）" : "请求已取消") : "网络请求失败"
     throw new PointsError(`loomy: ${location} ${reason}`)
   }
-  if (!resp.ok) throw new PointsError(`loomy: ${location} HTTP ${resp.status}`)
+  if (!resp.ok) {
+    // ⚠ 429 是**瞬时限流**，不是账号故障（真机实测：连打 10 次里 4 次 429，
+    // 之后 /models 仍正常）。把它当普通 HTTP 失败会让巡检/探测把号判坏，
+    // 所以错误对象上打 `rateLimited` 标记，调用方据此「保留原结论」。
+    const err = new PointsError(`loomy: ${location} HTTP ${resp.status}`)
+    if (resp.status === 429) err.rateLimited = true
+    throw err
+  }
   let env
   try {
     env = JSON.parse(text)
