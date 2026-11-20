@@ -287,11 +287,8 @@ async function handle(req, res, ctx) {
   if (path === "/api/route-check" && req.method === "POST") return routeCheck(req, res, ctx)
   if (path === "/api/route-check-batch" && req.method === "POST") return routeCheckBatchStart(req, res, ctx)
   if (path === "/api/route-check-batch" && req.method === "GET") return routeCheckBatchState(res, ctx, url.searchParams)
-  // 免费巡检：只读模型目录 + 账本/流量，**不发 chat、不扣积分**
   // 判定 → 生效：跑一次 `magpie plugin list`（实测唯一能让运行中 magpie 重拉模型列表的通道）
   if (path === "/api/apply-route" && req.method === "POST") return applyRouteRoute(res, ctx)
-  if (path === "/api/route-patrol-batch" && req.method === "POST") return patrolBatchStart(req, res, ctx)
-  if (path === "/api/route-patrol-batch" && req.method === "GET") return patrolBatchState(res, ctx, url.searchParams)
 
   // 余额：单行只刷这一个号；批量是「刷新全部」的全量入口
   if (path === "/api/accounts-refresh" && req.method === "POST") return accountRefreshOne(req, res, ctx)
@@ -650,19 +647,6 @@ export function routeCostHint(entry) {
  */
 export const ROUTE_COST_HINT = "检测会真实调用 1 次，扣 1 积分"
 
-// ── 免费巡检（0 积分） ──────────────────────────────────────────────────
-//
-// # 它和「检测」的区别
-//
-// 检测要发一次 chat（扣 1 积分）拿权威结论；巡检**只看模型目录 + 账本/流量**：
-//   · 目录里没有 DS4.1 / session 失效 / 账号停用 → 直接给结论（免费）
-//   · 其余情况 `{keep:true}` —— 不改 verdict，只更新 `catalogOkAt`
-//   · 有流量证据且与账本不符（traffic-mismatch）→ 可以改判（仍是免费）
-//
-// ⚠ 用 `patrolAccount`（单号）而不是 `patrolMany`（整批）：后者不做熔断，
-//   而上游限流时必须能「连续 3 次失败就停手」。并发槽 / 300ms 节流 / 熔断
-//   复用面板已有的那套（与余额刷新同一组参数）。
-
 // ── 判定 → 生效：`magpie plugin list` ────────────────────────────────────
 //
 // # 为什么是这条命令
@@ -773,171 +757,7 @@ function scheduleAutoApply(ctx, job) {
       job.applyError = String(e?.message ?? e).slice(0, 200)
     })
 }
-/** 巡检模块（缺失即 503；T-0x 并行开发，别在面板里伪造它）。 */
-async function ensurePatrolModule() {
-  if (patrolModulePromise === undefined) {
-    patrolModulePromise = import("./src/patrol.mjs")
-      .then((m) => (typeof m?.patrolAccount === "function" ? m : null))
-      .catch(() => null)
-  }
-  return patrolModulePromise
-}
-
-/**
- * `POST /api/route-patrol-batch {uids?}` → 立刻回 `{ok, jobId, total, costHint:0}`。
- */
-async function patrolBatchStart(req, res, ctx) {
-  /** @type {any} */
-  let input
-  try {
-    const raw = await readBody(req, 1 << 20)
-    input = raw ? JSON.parse(raw) : {}
-  } catch {
-    return sendJson(res, 400, { ok: false, error: "参数不是合法 JSON" })
-  }
-  if (!isPlainObject(input)) return sendJson(res, 400, { ok: false, error: "参数必须是 JSON 对象" })
-  if (!ctx.configDir) return sendJson(res, 503, { ok: false, error: "未设置 configDir，无法读取账号" })
-
-  const all = selectedAccounts(ctx, new URLSearchParams())
-  /** @type {any[]} */
-  let targets = all
-  if (input.uids !== undefined && input.uids !== null) {
-    if (!Array.isArray(input.uids)) return sendJson(res, 400, { ok: false, error: "uids 必须是数组" })
-    /** @type {string[]} */
-    const list = []
-    for (const raw of input.uids) {
-      if (typeof raw !== "string") return sendJson(res, 400, { ok: false, error: "uids 的每个元素都必须是字符串" })
-      const uid = raw.trim()
-      if (uid) list.push(uid)
-    }
-    if (!list.length) return sendJson(res, 400, { ok: false, error: "uids 不能为空（省略该字段表示巡检全部）" })
-    const wanted = new Set(list)
-    targets = all.filter((a) => wanted.has(a.uid))
-  }
-  if (!targets.length) return sendJson(res, 400, { ok: false, error: "没有需要巡检的账号" })
-
-  const mods = await ensureRouteModules(ctx)
-  if (!mods) return sendJson(res, 503, { ok: false, error: "检测模块未就绪" })
-  const patrol = await ensurePatrolModule()
-  if (!patrol) return sendJson(res, 503, { ok: false, error: "巡检模块未就绪" })
-
-  const jobId = randomUUID()
-  const job = { jobId, kind: "patrol", total: targets.length, running: true, stopped: "", kept: 0, updated: 0, results: /** @type {Record<string, object>} */ ({}) }
-  ctx.routeJobs.set(jobId, job)
-  void runPatrol(ctx, mods, patrol, job, targets)
-  return sendJson(res, 200, { ok: true, jobId, total: job.total, costHint: 0 })
-}
-
-/** 巡检队列：并发槽 + 300ms 启动节流 + 连续 3 次失败熔断（与余额刷新同一套）。 */
-async function runPatrol(ctx, mods, patrol, job, targets) {
-  let cursor = 0
-  let consecutiveFailures = 0
-  const worker = async () => {
-    for (;;) {
-      if (job.stopped) return
-      const index = cursor++
-      if (index >= targets.length) return
-      const account = targets[index]
-      await refreshGate(ctx)
-      if (job.stopped) return
-      /** @type {any} */
-      let result
-      try {
-        result = await withSlot(ctx, () => patrol.patrolAccount({
-          baseUrl: ctx.baseUrl,
-          session: account.session,
-          uid: account.uid,
-          configDir: ctx.configDir,
-          fetchImpl: ctx.fetchImpl,
-        }))
-      } catch (e) {
-        result = { error: sanitizeError(e, account.session) }
-      }
-      job.results[account.uid] = result
-      if (result?.error || isRateLimitFailure(result)) {
-        consecutiveFailures += 1
-        if (consecutiveFailures >= BATCH_BREAKER) job.stopped = "upstream-rate-limited"
-      } else {
-        consecutiveFailures = 0
-      }
-      if (!result || typeof result !== "object" || result.error) continue
-      // ⚠ keep:true 只更新 catalogOkAt，**绝不改** verdict（改判要靠流量证据或付费检测）
-      try {
-        const prior = typeof mods.getAccountRoute === "function" ? mods.getAccountRoute(ctx.configDir, account.uid) : null
-        if (result.keep) {
-          if (isPlainObject(prior) && Number.isFinite(Number(result.catalogOkAt)) && Number(result.catalogOkAt) > 0) {
-            await mods.writeRouteState(ctx.configDir, account.uid, { ...prior, catalogOkAt: Number(result.catalogOkAt) })
-          }
-          job.kept += 1
-          continue
-        }
-        if (result.verdict) {
-          await mods.writeRouteState(ctx.configDir, account.uid, {
-            verdict: result.verdict,
-            reason: result.reason ?? "",
-            servedModel: result.servedModel ?? "",
-            checkedAt: Number(result.checkedAt) || Date.now(),
-            catalogOkAt: Number(result.catalogOkAt) || Date.now(),
-          })
-          job.updated += 1
-        } else {
-          job.kept += 1
-        }
-      } catch (e) {
-        job.results[account.uid] = { ...result, error: sanitizeError(e, account.session) }
-      }
-    }
-  }
-  try {
-    // 巡检用**自己那条**设置（patrolConcurrency），不借用批量检测的并发
-    const patrolConcurrency = concurrencyFor("patrol", readPanelSettings(ctx.configDir).data)
-    await Promise.all(Array.from({ length: Math.min(patrolConcurrency, targets.length) }, worker))
-  } catch (e) {
-    ctx.log.warn?.(`loomy panel: 巡检异常收尾: ${String(e?.message ?? e).slice(0, 200)}`)
-  } finally {
-    job.running = false
-    // 判定写完了 → 自动让 magpie 重拉模型列表（utoApply 关掉时只记 applied:false）
-    scheduleAutoApply(ctx, job)
-    const timer = setTimeout(() => { ctx.routeJobs.delete(job.jobId) }, ROUTE_JOB_TTL_MS)
-    timer.unref?.()
-  }
-}
-
-/** `GET /api/route-patrol-batch?jobId=` → 进度（带 costHint:0 与 kept 计数）。 */
-function patrolBatchState(res, ctx, params) {
-  const jobId = String(params.get("jobId") ?? "").trim()
-  const job = jobId ? ctx.routeJobs.get(jobId) : null
-  if (!job || job.kind !== "patrol") return sendJson(res, 404, { ok: false, error: "没有这个巡检任务" })
-  let okCount = 0
-  let failCount = 0
-  for (const entry of Object.values(job.results)) {
-    if (isPlainObject(entry) && entry.error) failCount += 1
-    else okCount += 1
-  }
-  return sendJson(res, 200, {
-    ok: true,
-    job: {
-      jobId: job.jobId,
-      kind: "patrol",
-      total: job.total,
-      done: okCount + failCount,
-      okCount,
-      failCount,
-      kept: job.kept,
-      updated: job.updated,
-      running: job.running,
-      stopped: job.stopped || "",
-      costHint: 0,
-      // 判定写完后是否已让 magpie 重拉（`autoApply` 关掉时恒为 false）
-      applied: job.applied === true,
-      applyError: job.applyError || "",
-      results: job.results,
-    },
-  })
-}
-
-/**
- * 批量检测的边界。
+/** 批量检测的边界。
  *
  * # 并发默认 2，**没有上限**（用户要求）
  *
@@ -962,9 +782,6 @@ export const ROUTE_BATCH_BREAKER = 3
 const BATCH_GAP_MS = ROUTE_BATCH_GAP_MS
 const BATCH_BREAKER = ROUTE_BATCH_BREAKER
 
-/** src/patrol.mjs 的加载缓存（缺失即 null；补上后需要重启插件进程）。 */
-let patrolModulePromise
-
 /**
  * 取探测模块；没就绪返回 null。
  *
@@ -982,23 +799,22 @@ function ensureRouteModules(ctx) {
 
 /** 动态加载 `src/route.mjs` 与 `src/route-store.mjs`（缺失即 null）。 */
 async function loadRouteModules() {
-  const [probe, store, byTurn] = await Promise.all([
+  const [probe, store] = await Promise.all([
     import("./src/route.mjs").catch(() => null),
     import("./src/route-store.mjs").catch(() => null),
-    import("./src/byturn.mjs").catch(() => null),
   ])
   if (typeof probe?.probeRoute !== "function") return null
   if (typeof store?.readRouteState !== "function" || typeof store?.writeRouteState !== "function") return null
   return {
-    probeRoute: probe.probeRoute,
     /**
-     * 面板「检测」的默认通道：**by-turn**。
+     * 面板「检测」的唯一通道：**只读判定**（`probeRoute`）。
      *
-     * 目录会谎报、账本只能猜时间窗；只有 by-turn 能说清「这一轮到底由谁服务」。
-     * 所以单行「检测」与批量检测都走它（发一条带 TurnId 的最小请求 → 回查）。
-     * `probeRoute` 保留作为一次性检查的后备。
+     * 目录 + 账本 + 余额，**0 积分**。原来还有一条 by-turn 通道（发一次计费
+     * chat、再用 TurnId 回查），T-38 整段删除：响应体每个 chunk 自带 `model`，
+     * 而「这一轮实际由谁服务」由 loader 旁路读取（见 `noteServedModel`），
+     * 不必再为它额外打一次上游。
      */
-    probeByTurn: typeof byTurn?.probeByTurn === "function" ? byTurn.probeByTurn : undefined,
+    probeRoute: probe.probeRoute,
     readRouteState: store.readRouteState,
     writeRouteState: store.writeRouteState,
     getAccountRoute: store.getAccountRoute,
@@ -1413,12 +1229,9 @@ function probeAccountRoute(ctx, mods, uid, session) {
   if (inflight) return inflight
 
   const task = (async () => {
-    // 默认走 by-turn（唯一能说清「这一轮实际由谁服务」的通道）；
-    // 注入的测试桩若只给了 probeRoute，就退回旧的探测。
-    const entry =
-      typeof mods.probeByTurn === "function"
-        ? await mods.probeByTurn({ baseUrl: ctx.baseUrl, session, fetchImpl: ctx.fetchImpl })
-        : await mods.probeRoute({ baseUrl: ctx.baseUrl, session, fetchImpl: ctx.fetchImpl })
+    // 唯一通道：只读判定（`probeRoute`：目录 + 账本 + 余额，0 积分）。
+    // by-turn 那条通道（发一次计费 chat 再回查）T-38 已整段删除。
+    const entry = await mods.probeRoute({ baseUrl: ctx.baseUrl, session, fetchImpl: ctx.fetchImpl })
     if (!entry || typeof entry !== "object") throw new Error("探测模块没有返回结果")
     const kept = entry.verdict === "unknown" && hasStoredRoute(mods, ctx.configDir, uid)
     let stored = !kept
@@ -1949,10 +1762,9 @@ export const PANEL_SETTINGS_DEFAULTS = Object.freeze({
   balanceConcurrency: 2,
   tasksConcurrency: 2,
   inviteConcurrency: 2,
-  patrolConcurrency: 2,
   // 每次真实调用之间的启动间隔（毫秒，0 = 不等待；不是并发，是保护）
   gapMs: 300,
-  // 判定自动生效：巡检/检测完成后自动重拉 magpie 模型列表
+  // 判定自动生效：检测完成后自动重拉 magpie 模型列表
   autoApply: true,
   // magpie 可执行文件路径；空 = 自动探测
   magpiePath: "",
@@ -1971,7 +1783,6 @@ const CONCURRENCY_KEYS = Object.freeze({
   balance: "balanceConcurrency",
   tasks: "tasksConcurrency",
   invite: "inviteConcurrency",
-  patrol: "patrolConcurrency",
 })
 
 /** 设置里所有「并发」类键（含旧别名 batchConcurrency）。 */
@@ -1980,7 +1791,6 @@ const CONCURRENCY_KEY_LIST = Object.freeze([
   "balanceConcurrency",
   "tasksConcurrency",
   "inviteConcurrency",
-  "patrolConcurrency",
   "batchConcurrency",
 ])
 
@@ -1990,7 +1800,7 @@ const CONCURRENCY_KEY_LIST = Object.freeze([
  * `route` 兼容旧别名：优先 `routeConcurrency`，没有则回落 `batchConcurrency`，
  * 再没有才用 2（保证老调用不坏）。
  *
- * @param {"route"|"balance"|"tasks"|"invite"|"patrol"} kind
+ * @param {"route"|"balance"|"tasks"|"invite"} kind
  * @param {Record<string, any>} settings
  * @returns {number} 整数 ≥1（不设上限）
  */
@@ -2130,7 +1940,6 @@ async function savePanelSettings(req, res, ctx) {
   "balanceConcurrency",
   "tasksConcurrency",
   "inviteConcurrency",
-  "patrolConcurrency",
   "gapMs",
   "batchSkipChecked",
   "ledgerReads",

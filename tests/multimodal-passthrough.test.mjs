@@ -46,7 +46,7 @@ async function loaderWith(opts) {
 for (const bodyMode of ["client-body", "client-shape", "default", "passthrough"]) {
   test(`bodyMode:${bodyMode} → messages[].content 数组原样透传`, async () => {
     const { calls, fetchImpl } = capture()
-    const loader = await loaderWith({ fetchImpl, bodyMode, byTurnFetch: async () => ({ found: false }) })
+    const loader = await loaderWith({ fetchImpl, bodyMode })
 
     await loader.fetch(CHAT_URL, {
       method: "POST",
@@ -65,7 +65,7 @@ for (const bodyMode of ["client-body", "client-shape", "default", "passthrough"]
 
 test("tool 消息与 assistant 消息里的数组 content 也不被改写", async () => {
   const { calls, fetchImpl } = capture()
-  const loader = await loaderWith({ fetchImpl, bodyMode: "client-body", byTurnFetch: async () => ({ found: false }) })
+  const loader = await loaderWith({ fetchImpl, bodyMode: "client-body" })
 
   const history = [
     { role: "user", content: PARTS },

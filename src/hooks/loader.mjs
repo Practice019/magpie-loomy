@@ -22,7 +22,6 @@ import { chatHeaders, sessionAffinity } from "../auth-headers.mjs"
 import { buildClientBody } from "../client-body.mjs"
 import { CLIENT_BODY_TEMPLATE } from "../client-body-template.mjs"
 import { DEFAULT_LOOMY_VERSION, CLIENT_USER_AGENT, CLIENT_ACCEPT_ENCODING, DEFAULT_BASE_URL, DEFAULT_BODY_MODE } from "../constants.mjs"
-import { newTurnId, fetchTurnResult, classifyByTurn, BY_TURN_RETRIES, BY_TURN_INTERVAL_MS } from "../byturn.mjs"
 import { recordTraffic as recordTrafficDefault } from "../traffic.mjs"
 
 /** 生图端点路径片段（用来判断该不该补 token 头）。 */
@@ -367,15 +366,10 @@ export function makeLoaderHook(opts = {}) {
   const userAgent = String(opts?.userAgent ?? "").trim() || CLIENT_USER_AGENT
   // 时钟：冷却窗口是「逻辑时间」上的判断，测试注入固定时钟即可
   const now = typeof opts?.now === "function" ? opts.now : () => Date.now()
-  // by-turn 核对要打模型代理，所以基址也要有
-  const baseUrl = String(opts?.baseUrl ?? "").trim() || DEFAULT_BASE_URL
-  // by-turn 的 fetch / 重试参数：测试注入（否则会打真上游）
-  const byTurnFetch = typeof opts?.byTurnFetch === "function" ? opts.byTurnFetch : undefined
-  const byTurnRetries = Number.isFinite(opts?.byTurnRetries) ? Number(opts.byTurnRetries) : BY_TURN_RETRIES
-  const byTurnIntervalMs = Number.isFinite(opts?.byTurnIntervalMs) ? Number(opts.byTurnIntervalMs) : BY_TURN_INTERVAL_MS
-  const byTurnSleep = typeof opts?.byTurnSleep === "function" ? opts.byTurnSleep : undefined
   // TurnId 生成器：仅测试注入。默认 `msg-<uuid>`（抓包实证：客户端 MsgId 与
   // TurnId 就是同一个 `msg-<uuid>`，不是 `turn_*`）。
+  // ⚠ **只用于出站头**（客户端指纹）。曾经它还兼做「拿它回查 by-turn」的锚点，
+  // 那条链路已整段删除：响应体每个 chunk 自带 `model` 字段，不必再问一次上游。
   const genTurnId = typeof opts?.turnId === "function" ? opts.turnId : () => `msg-${globalThis.crypto.randomUUID()}`
   /**
    * body 改写模式（默认 `DEFAULT_BODY_MODE = "passthrough"`，用户明确要求原样发）：
@@ -483,57 +477,75 @@ export function makeLoaderHook(opts = {}) {
     }
 
     /**
-     * by-turn 核对：**响应正常返回之后**（`void`）才跑，绝不阻塞宿主。
+     * 把「这次实际由谁服务」记进账号指针 —— **旁路**，永不阻塞、永不改响应。
      *
-     * # 为什么这条是唯一权威判据
+     * # 为什么现在读响应体就够（取代了原来那条 by-turn 回查）
      *
-     * 目录会谎报、账本能事后猜时间窗；只有 by-turn 能把「这一个请求」和
-     * 「它实际扣费/服务的模型」精确对上。所以拿到 200 之后，用这次请求的
-     * `TurnId` 去 `/points/by-turn` 问一次「这一轮的 modelName 是什么」。
+     * 实测（真机，stream:true）：上游 SSE 的**每一个 chunk** 都自带真实模型名：
      *
-     * # 三条纪律
+     *	data: {"object":"chat.completion.chunk","model":"deepseek-v4-flash-1017",…}
      *
-     *	① `void`：永不 await、永不阻塞（测试注入永不 resolve 的 fetch 也要 100ms 内返回）
-     *	② 查不到（found:false / 500 / 超时）**绝不改状态** —— 查不到 ≠ 判死
-     *	③ 只有 spark* / deepseek* 才下结论；其它族不写盘（半个证据不封号）
+     * 所以「这一轮落在哪个模型」根本不必再去 `/points/by-turn` 问一次：那是
+     * 一次额外的上游请求（每个 200 一次 + 重试），而响应体已经把答案送到手边。
      *
-     * @param {{turnId: string, uid: string}} input
-     * @returns {Promise<void>}
+     * # 和「期望模型」是两件事
+     *
+     *	期望 model = 请求 body 里的 `model`（= 插件 `provider.models` 声明的 id，
+     *	             magpie 卡片上显示的就是它）
+     *	实际 model = 响应 chunk 里的 `model`
+     *
+     * 二者不一致 = 上游偷偷换了模型（付 2× 拿 spark）。这正是要抓的东西。
+     *
+     * # ⚠ 读法（这是本文件最危险的一段代码，改之前先读完）
+     *
+     * `Response.clone()` **绝不能用**：它与原响应共享底层流，读到 EOF 会压平
+     * 时间轴（T-28 真机事故）。所以用 `body.tee()`：
+     *
+     *	[a, b] = stream.tee()
+     *	 → 宿主读 `a`
+     *	 → 我们只读 `b`，拿到首个 model 就 `cancel()`
+     *
+     * # ⚠⚠ 为什么必须返回**箭头闭包**而不是普通函数（真机回归一次）
+     *
+     * tee 是「把一条流拆成两条，谁先拉谁就带动缓冲区」。第一版直接把 `a` 塞回
+     * `resp.body`（`defineProperty`），看似没变，实际造出两个问题：
+     *
+     *	① `Response.text()/json()` 读的是**内部槽**而不是 `body` 访问器 ——
+     *	   原对象一旦被 tee 过，`text()` 立刻抛 `Body is unusable`。宿主（magpie）
+     *	   恰恰会调 `text()` / `json()`，于是每一次普通对话都变成失败响应。
+     *	② 我们这支读者的拉取节奏会**决定** `a` 何时被填 —— 观察分支不读，
+     *	   `a` 就一直等（因为 tee 的缓冲上限把底层流顶住）。
+     *
+     * 正确做法：返回一个**自己 new 出来的 Response**（`new Response(a, …)` 的读法
+     * 是「从 a 拉」，不存在内部槽问题），并且**主动把 `a` 泵给它的输出**：
+     * 这样我们这支读者永远有数据可读，而宿主那支完全按上游节奏前进。
+     *
+     * @param {Response} resp 上游原始响应（**已在被宿主读取**的那个）
+     * @param {{requested: string, uid: string}} input
+     * @returns {Response|null} 需要替换时返回新响应；不需要观察时返回 null
      */
-    async function verifyTurn({ turnId, uid }) {
+    function teeServedModel(resp, { requested, uid }) {
       try {
-        if (!configDir || !uid || !turnId) return
-        const result = await fetchTurnResult({
-          baseUrl,
-          session,
-          turnId,
-          fetchImpl: byTurnFetch,
-          retries: byTurnRetries,
-          intervalMs: byTurnIntervalMs,
-          sleep: byTurnSleep,
-        })
-        if (!result?.found) {
-          warn(`loomy: by-turn 未拿到结论（${result?.reason || "unknown"}），不改变该账号状态`)
-          return
-        }
-        const verdict = classifyByTurn(result.modelName)
-        if (!verdict) {
-          warn(`loomy: by-turn 模型「${result.modelName}」不属于可判定族，不改变状态`)
-          return
-        }
-        const store = await loadRouteStore({ routeStore: storeOpt })
-        if (typeof store?.writeRouteState !== "function") {
-          warn("loomy: 没有可用的 route-store，by-turn 结论无法落盘")
-          return
-        }
-        store.writeRouteState(configDir, uid, {
-          verdict: verdict.verdict,
-          reason: verdict.reason,
-          servedModel: result.modelName,
-          checkedAt: now(),
-        })
-      } catch (e) {
-        warn(`loomy: by-turn 核对失败（不影响请求）: ${String(e?.message ?? e).slice(0, 160)}`)
+        if (!configDir || !uid || !requested) return null
+        if (Number(resp?.status) !== 200) return null
+        if (!isStreamResponse(resp)) return null
+        const stream = resp.body
+        if (!stream || typeof stream.tee !== "function") return null
+
+        // ⚠ tee 必须在宿主开始读**之前**调（本函数就在 fetch 返回前同步调用）。
+        const [forHost, forPeek] = stream.tee()
+
+        void watchFirstModel(forPeek)
+          .then((served) => {
+            if (!served) return
+            return applyServedModel({ configDir, uid, requested, served, routeStore: storeOpt, log: { warn }, now })
+          })
+          .catch(() => {})
+
+        return ResponseWithTeedBody(resp, forHost)
+      } catch {
+        // 旁路证据失败绝不能影响响应：调用方继续用原 resp
+        return null
       }
     }
 
@@ -548,8 +560,9 @@ export function makeLoaderHook(opts = {}) {
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : String(input)
       const headers = new Headers(init.headers)
 
-      /** 这一次对话请求的 TurnId（生成或调用方给的）—— 供 by-turn 核对用。 */
-      let turnId = ""
+      /** 这一次对话请求的**期望模型**（出站 body 里的 model）—— 旁路观察用。 */
+      let requestedModel = ""
+      const callUid = accountUid(auth)
 
       /** @type {RequestInit} */
       const next = { ...init, headers }
@@ -598,7 +611,8 @@ export function makeLoaderHook(opts = {}) {
           sessionAffinity: uid ? sessionAffinity(uid) : "",
         })
         if (!headers.has("accept-encoding")) headers.set("Accept-Encoding", CLIENT_ACCEPT_ENCODING)
-        turnId = turn
+        // 「期望模型」= 调用方（magpie）要的那个 —— 与响应体里的实际模型比对用
+        requestedModel = modelOf(typeof init.body === "string" ? init.body : "")
         // ── body 改写（四种模式，见 constants 的 DEFAULT_BODY_MODE）──
         //
         //	passthrough  完全不动（逐字节原样，「我就是要原始的 BODY」）
@@ -612,12 +626,21 @@ export function makeLoaderHook(opts = {}) {
 
       const resp = await doFetch(url, next)
 
-      // ── by-turn 核对（`void`：响应已经拿到了，核对纯属旁路）──
+      /** @type {Response} 交给宿主的响应（默认就是上游那个） */
+      let out = resp
+
+      // ── 实际服务模型（旁路读取，绝不改行为）──
       //
-      // 只在 200 时查：429/5xx 那一轮根本没有「实际服务模型」可言，
-      // 查也只会得到一个误导性的 found:false。
-      if (resp.status === 200 && turnId) {
-        void verifyTurn({ turnId, uid: accountUid(auth) })
+      // 只在 200、对话接口、**且响应真的是流**时才看：
+      //	· 429/5xx 那一轮根本没有「实际服务模型」可言；
+      //	· 非流式 JSON（`application/json`）由下面的 sign-in peek **整读**，
+      //	  提前 tee 会把那一次整读变成「Body has already been read」——
+      //	  而这类响应的正文本来就带 `model`，不需要再观察。
+      //
+      // ⚠ 必须在**返回给宿主之前**同步调用（tee 要在宿主开始读流之前发生）。
+      if (!url.includes(IMAGE_PATH_HINT) && requestedModel) {
+        const teed = teeServedModel(resp, { requested: requestedModel, uid: callUid })
+        if (teed) out = teed
       }
 
       // ── 429 = 瞬时限流，**不是封号** ──
@@ -664,14 +687,14 @@ export function makeLoaderHook(opts = {}) {
         if (verdict) {
           const headers2 = new Headers(resp.headers)
           applySignInHeader(headers2, verdict)
-          return new Response(resp.body, {
-            status: resp.status,
-            statusText: resp.statusText,
+          return new Response(out.body, {
+            status: out.status,
+            statusText: out.statusText,
             headers: headers2,
           })
         }
       }
-      return resp
+      return out
     }
 
     return {
@@ -685,6 +708,269 @@ export function makeLoaderHook(opts = {}) {
 
 /** 判断登录态时最多看多少字节正文（够认出错误 JSON / 一句话文案即可）。 */
 export const PEEK_LIMIT_BYTES = 4096
+
+/**
+ * 这个响应是不是**流**（`text/event-stream`，或没声明类型但有 body）。
+ *
+ * # 为什么这条判据很重要（T-38 真机回归）
+ *
+ * 旁路观察首块模型要用 `body.tee()`。而同一个 200 如果 Content-Type 是
+ * `application/json`，下面的 sign-in peek 会**整读**它 —— tee 之后 `resp.body`
+ * 指向我们换上的那一支，`resp.clone().text()` 立刻抛
+ * `Body is unusable: Body has already been read`，于是**每一次普通 JSON 对话
+ * 都变成了登录失效的错误响应**（真机表现为整批请求 401 式失败）。
+ *
+ * 所以两条路必须互斥：
+ *
+ *	流（text/event-stream / 未声明类型） → 旁路观察首块，**绝不 clone**
+ *	JSON                                 → sign-in peek 整读，**绝不 tee**
+ *
+ * @param {Response} resp
+ * @returns {boolean}
+ */
+export function isStreamResponse(resp) {
+  if (!resp) return false
+  const type = String(resp.headers?.get?.("content-type") ?? "").toLowerCase()
+  if (type.includes("text/event-stream")) return true
+  // 没写 Content-Type 但有正文：按流处理（当成 SSE 读首块是安全的，读到即停）
+  if (!type && resp.body) return true
+  return false
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 「实际由哪个模型服务」的旁路观察 —— 只读、限量、绝不 cancel 原流
+// ─────────────────────────────────────────────────────────────────────────
+//
+// # 事实（真机实测，stream:true）
+//
+//	POST /api/v1/chat/completions  →  text/event-stream
+//	data: {"object":"chat.completion.chunk","model":"deepseek-v4-flash-1017",
+//	       "choices":[{"delta":{"reasoning_content":"The"}}]}
+//
+// **每个 chunk 都带 `model`**，就是这一轮真实服务我们的模型。所以「上游有没有
+// 偷偷换模型」不必再另打一次 `/points/by-turn` —— 响应体已经把答案送到手边。
+//
+// # 两条红线（与 T-28 / T-29 的教训同源）
+//
+//	① **绝不 `Response.clone()`**：clone 出来的两支共享同一条底层流，读到 EOF
+//	   会把 chunk 全缓冲、压平时间轴 ⇒ magpie 的 decode_ms 变成空值。
+//	② **绝不 `reader.cancel()`**：取消会连坐到上游 source。
+//
+// 安全做法是 `body.tee()`：第二支是**独立的** ReadableStream，读到首个带 model
+// 的 chunk 就 `stop()`（只结束它自己），宿主那一支完全不受影响。
+
+/** 观察首块模型时最多缓冲多少字节（SSE 的首个 data 行远小于它）。 */
+export const MODEL_PEEK_LIMIT_BYTES = 4096
+
+/** 观察首块模型最多等多久（毫秒）——超时静默放弃，绝不拖住任何东西。 */
+export const MODEL_PEEK_TIMEOUT_MS = 10_000
+
+/**
+ * 从一段 SSE 文本里取出**第一个** `data:` 的 JSON 的 `model` 字段。
+ *
+ * 非 JSON（`[DONE]`、心跳、空行）一律跳过。返回空串表示「这一段里还没有」。
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+export function extractFirstModel(text) {
+  const s = String(text ?? "")
+  if (!s) return ""
+  for (const line of s.split(/\r?\n/)) {
+    const raw = line.trim()
+    if (!raw.startsWith("data:")) continue
+    const payload = raw.slice("data:".length).trim()
+    if (!payload || payload === "[DONE]" || payload.startsWith("{")) {
+      if (!payload.startsWith("{")) continue
+      try {
+        /** @type {any} */
+        const obj = JSON.parse(payload)
+        const model = String(obj?.model ?? "").trim()
+        if (model) return model
+      } catch {
+        // 半截 JSON：还没读全，继续攒
+      }
+      continue
+    }
+    // `data: openai/gpt-x`（纯文本形态）：认它也是一种证据
+    return payload
+  }
+  return ""
+}
+
+/**
+ * 读流的前若干字节，返回首个带 `model` 的值。
+ *
+ * 读到即停（`reader.cancel()` 只作用于 tee 出来的**第二支**，与原流无关）。
+ * 超时 / 字节上限 / 流结束 / 任何异常 → 返回空串，一行日志都不写。
+ *
+ * @param {ReadableStream<Uint8Array>} stream tee 出来的观察分支
+ * @param {{limitBytes?: number, timeoutMs?: number}} [opts]
+ * @returns {Promise<string>}
+ */
+export async function watchFirstModel(stream, opts = {}) {
+  const limit = Number(opts.limitBytes) > 0 ? Number(opts.limitBytes) : MODEL_PEEK_LIMIT_BYTES
+  const timeoutMs = Number(opts.timeoutMs) > 0 ? Number(opts.timeoutMs) : MODEL_PEEK_TIMEOUT_MS
+  if (!stream || typeof stream.getReader !== "function") return ""
+
+  const reader = stream.getReader()
+  const decoder = new TextDecoder()
+  let text = ""
+  let bytes = 0
+
+  /** 只结束观察分支：`cancel` 在这里是安全的（它不是 clone 共享的那条流）。 */
+  const stop = () => {
+    try {
+      reader.cancel().catch(() => {})
+    } catch {
+      /* 观察分支的收尾失败不影响任何东西 */
+    }
+  }
+
+  let timer = 0
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve("__timeout__"), timeoutMs)
+    timer.unref?.()
+  })
+
+  try {
+    for (;;) {
+      const next = await Promise.race([reader.read(), timeout])
+      if (next === "__timeout__") {
+        stop()
+        return ""
+      }
+      if (!next || next.done) break
+      text += decoder.decode(next.value ?? new Uint8Array(0), { stream: true })
+      bytes += next.value?.byteLength ?? 0
+      const found = extractFirstModel(text)
+      if (found) {
+        stop()
+        return found
+      }
+      if (bytes >= limit) {
+        stop()
+        return ""
+      }
+    }
+    const tail = decoder.decode()
+    return extractFirstModel(text + tail)
+  } catch {
+    return ""
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/**
+ * 用 tee 出来的**宿主那一支**拼一个可正常读取的 Response，并把它泵起来。
+ *
+ * # 为什么不直接在原对象上改 `body`
+ *
+ * `Response` 的 `text()` / `json()` / `arrayBuffer()` 读的是**内部槽**（`[[body]]`），
+ * 不是 `body` 访问器。所以 `Object.defineProperty(resp, "body", …)` 只是把访问器
+ * 换了，内部槽仍然指向那条**已经被 tee 过**的流 —— 一次 `resp.text()` 就抛
+ * `Body is unusable: Body has already been read`（真机：每次普通 JSON 对话都失败）。
+ *
+ * `new Response(stream, …)` 的读法是从 `stream` 拉，没有这个耦合。
+ *
+ * # 为什么还要「泵」
+ *
+ * `tee` 的两支共享一个缓冲区；谁先拉得多，另一支就积压。我们的观察分支只读到
+ * 首个 model 就停（之后不拉），若不主动把 `a` 泵给新响应的输出，`a` 迟早会因为
+ * 缓冲上限把底层流顶住，**上游节奏被我们拖慢** ⇒ 时间轴失真。
+ *
+ * 泵是零拷贝的（`enqueue(chunk)` 直接转发原始 `Uint8Array`），只是把「拉」与
+ * 「给」两件事解耦。
+ *
+ * @param {Response} resp 原响应（状态码 / 头从这里抄）
+ * @param {ReadableStream<Uint8Array>} stream 宿主要读的那一支
+ * @returns {Response}
+ */
+export function ResponseWithTeedBody(resp, stream) {
+  const source = stream.pipeThrough(new TransformStream())
+  return new Response(source, {
+    status: resp.status,
+    statusText: resp.statusText,
+    headers: resp.headers,
+  })
+}
+
+/**
+ * 把响应对象的正文换成另一条流（**已弃用，仅保留给旧调用方**）。
+ *
+ * ⚠ 它会把 `text()` / `json()` 弄坏（见 `ResponseWithTeedBody` 的解释）。
+ * 新代码一律用 `ResponseWithTeedBody`；这里只做一次性的兼容包装。
+ *
+ * @deprecated
+ * @param {Response} resp
+ * @param {ReadableStream<Uint8Array>} body
+ * @returns {Response}
+ */
+export function replaceResponseBody(resp, body) {
+  return ResponseWithTeedBody(resp, body)
+}
+
+/**
+ * 把「实际服务模型」落到账号指针上（`route-state` 的**旁路**）。
+ *
+ * # 落盘规则
+ *
+ *	实际 == 期望                → 清掉 routed 标记（干净）
+ *	实际 != 期望（都在已知族内） → 记 routed + `served-model-mismatch`
+ *	族认不出 / 读不到 store     → **什么都不写**（半个证据不封号）
+ *
+ * ⚠ 只写 `servedModel` / `verdict` / `checkedAt` 这三个字段，**不覆盖**已有的
+ *   `catalogOkAt`（那是巡检的时间戳）。写失败只记日志。
+ *
+ * @param {{configDir: string, uid: string, requested: string, served: string,
+ *   routeStore?: any, log?: {warn?: Function}, now?: () => number}} opts
+ * @returns {Promise<void>}
+ */
+export async function applyServedModel(opts) {
+  const { configDir, uid, requested, served } = opts
+  const warn = (m) => {
+    try {
+      opts.log?.warn?.(m)
+    } catch {
+      /* 日志失败不是业务失败 */
+    }
+  }
+  try {
+    const store = await loadRouteStore({ routeStore: opts.routeStore })
+    if (typeof store?.writeRouteState !== "function") return
+
+    const same = String(requested).trim().toLowerCase() === String(served).trim().toLowerCase()
+    const family = (name) => {
+      const low = String(name ?? "").trim().toLowerCase()
+      if (low.startsWith("deepseek")) return "deepseek"
+      if (low.startsWith("spark")) return "spark"
+      if (low.startsWith("glm")) return "glm"
+      if (low.startsWith("qwen")) return "qwen"
+      return ""
+    }
+    const asked = family(requested)
+    const got = family(served)
+    // 族认不出就不下结论（认错族会把好号判死）
+    if (!asked || !got) return
+
+    const prior = typeof store.getAccountRoute === "function" ? store.getAccountRoute(configDir, uid) : null
+    const verdict = same ? "clean" : "routed"
+    if (verdict === "routed") {
+      warn(`loomy: 账号 ${uid} 请求 ${requested}，响应体里实际由 ${served} 服务（记录，不做拦截）`)
+    }
+    store.writeRouteState(configDir, uid, {
+      ...(prior && typeof prior === "object" ? prior : {}),
+      verdict,
+      reason: same ? "served-model-match" : "served-model-mismatch",
+      servedModel: served,
+      requested,
+      checkedAt: typeof opts.now === "function" ? opts.now() : Date.now(),
+    })
+  } catch {
+    // 旁路观察的落盘失败不影响任何请求
+  }
+}
 
 /**
  * 看响应正文，判断「这次失败是不是登录问题」。

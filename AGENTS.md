@@ -13,6 +13,7 @@
 | **改登录** | `src/hooks/methods.mjs`、`src/sms-login.mjs`、`src/client-store.mjs` | `npm test` 绿 + 真机登录成功 |
 | **改请求转发** | `src/hooks/loader.mjs`、`src/prepare-body.mjs`、`src/auth-headers.mjs` | `magpie provider test loomy` 通过 |
 | **改额度/积分/任务/邀请码** | `src/points.mjs`、`src/usage.mjs` | `magpie accounts` 里额度显示正确 |
+| **改模型目录缓存** | `src/models-cache.mjs`、`src/hooks/models.mjs` | `npm test` 里 `models-cache.test.mjs` 全绿（301 并发只 1 次上游） |
 | **改面板** | `server.mjs`、`page/` | `node server.mjs` 后四个标签页都能出数据 |
 | **上游改了模型名** | `src/models.mjs` | 静态表能对上实时目录，倍率解析正确 |
 
@@ -70,11 +71,39 @@
 
 ## 四、两条实测事实（改代码前必须知道）
 
-1. **上游按账号权限下发不同模型集。** 同一个上游的两个号给出的集合只有部分交集。
-   所以 `provider.models` 每账号问一次，静态表只做冷启动兜底。
+1. **模型目录是 provider 级属性，只能拉一次。**（T-38 修正）
+   原来是「每个账号问一次」—— 301 个号 × 每次 magpie 重读列表 = 301 次请求，
+   开发者一天重启 8 次 ≈ 2400 次，服务端判成**批量探测** ⇒ 风控 ⇒ session 失效
+   （实测 19 个 expired，18 个 session-expired）。**掉号的根因就是我们自己打的。**
+   现在：`<configDir>/loomy-models-cache.json` 文件缓存（**无 TTL，永不自动失效**）
+   → 命中即返回、零上游；未命中时模块级单飞去重，整个 provider 只拉一次；
+   失败不写缓存（下次还能重试）。想刷新就删文件 / 调 `clearModelsCache`。
+   判据全在 `tests/models-cache.test.mjs`（含「301 并发只 1 次」）。
 2. **session 不会过期，也没有 refresh token。** 证据：客户端重启多次 session 值不变、
    Local Storage 里该键只 1 条历史、源码里没有 refresh 判断、`/models` 响应无 expires。
-   所以 `expires: 0` 是**正确表达**，不是占位符。
+   所以 `expires: 0` 是**正确表达**，不是占位符；也就**不实现** `auth.refresh`
+   （空壳会让宿主误判「能自动恢复」）。
+
+## 四之二、响应体自带模型名（不再需要 by-turn）
+
+实测 `stream:true` 时**每个 SSE chunk 都带 `model`**：
+
+```
+data: {"object":"chat.completion.chunk","model":"deepseek-v4-flash-1017",…}
+```
+
+所以「这一轮实际由谁服务」读响应体首块就够，`/points/by-turn`（那次额外计费
+chat + 轮询账本）**整段删除**。要点：
+
+- 读法是 `body.tee()`，**不是** `Response.clone()`（clone 读到 EOF 会压平时间轴，
+  见 `tests/loader-peek.test.mjs` 的红线）。
+- 观察分支读到首个 `model` 就 `cancel()`（只结束它自己，不影响宿主那支）。
+- **必须返回新 Response**（`ResponseWithTeedBody`），不能在原对象上
+  `defineProperty(body)` —— `text()/json()` 读的是内部槽，改访问器会让每次普通
+  对话都抛 `Body is unusable`（真机回归过）。
+- 非流式 JSON 200 **不 tee**：那条路由 sign-in peek 整读。
+- 结果只写 `route-state`（`served-model-mismatch` / `served-model-match`），
+  **不做拦截**（「别选我」只走 `provider.models` 空目录）。
 
 ---
 

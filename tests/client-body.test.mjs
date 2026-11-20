@@ -16,7 +16,6 @@ import { readFileSync } from "node:fs"
 import { buildClientBody } from "../src/client-body.mjs"
 import { CLIENT_BODY_TEMPLATE } from "../src/client-body-template.mjs"
 import { DEFAULT_BODY_MODE } from "../src/constants.mjs"
-import { probeByTurn } from "../src/byturn.mjs"
 import { makeLoaderHook } from "../src/hooks/loader.mjs"
 
 const SESSION = "s".repeat(32)
@@ -121,26 +120,38 @@ test("DEFAULT_BODY_MODE === \"client-body\"，且 loader 默认出站 body 与�
   assert.equal(body.stream, true)
 })
 
-test("probeByTurn 出站 body 与模板同形，且带 TurnId 头", async () => {
+// ── T-38：by-turn 探测整段删除，只留 loader 的出站形态 ──────────────────
+//
+// `probeByTurn` / `newTurnId` / `fetchTurnResult` 已随 `/points/by-turn` 一起删除：
+// 响应体每个 chunk 自带真实 `model`，不必再发一次计费 chat 去回查（详见
+// `tests/loader-served-model.test.mjs` 与 `src/hooks/loader.mjs` 的注释）。
+//
+// 但「出站 body 必须是客户端形态」这条结论**不依赖**任何探测通道，改用 loader
+// 自己的出站头来钉：客户端是 `ChatId / MsgId / TurnId = msg-<uuid>` 三条同源。
+
+test("loader 出站 body 与模板同形，且三类客户端头齐全（TurnId 与 MsgId 同值）", async () => {
   /** @type {any} */
   let chat = null
-  const fetchImpl = async (url, init) => {
-    if (String(url).includes("/chat/completions")) {
-      chat = init
-      return Response.json({ choices: [] })
-    }
-    return Response.json({ data: { found: true, modelName: "deepseek-v4-flash-1017" } })
+  const fetchImpl = async (_url, init) => {
+    chat = init
+    return Response.json({ choices: [] })
   }
 
-  await probeByTurn({ baseUrl: BASE, session: SESSION, fetchImpl })
-  const body = JSON.parse(String(chat.body))
+  const loader = await loaderWith({ fetchImpl })
+  await loader.fetch(CHAT_URL, { method: "POST", body: JSON.stringify({ model: "DeepSeek-V4.1-Flash", messages: [{ role: "user", content: "ping" }] }) })
 
+  const body = JSON.parse(String(chat.body))
   assert.deepEqual(body.tools, CLIENT_BODY_TEMPLATE.tools)
   assert.equal(body.max_tokens, CLIENT_BODY_TEMPLATE.max_tokens)
   assert.equal(body.reasoning_effort, CLIENT_BODY_TEMPLATE.reasoning_effort)
   assert.equal(body.stream, true)
   assert.equal(body.messages[0].content, CLIENT_BODY_TEMPLATE.messages[0].content)
-  assert.match(String(new Headers(chat.headers).get("turnid")), /^turn_probe_/)
+
+  const headers = new Headers(chat.headers)
+  // 抓包实证：客户端 MsgId 与 TurnId 就是同一个 `msg-<uuid>`
+  assert.match(String(headers.get("turnid")), /^msg-/, "TurnId 生成器默认给 msg-<uuid>，不是 turn_*")
+  assert.equal(headers.get("msgid"), headers.get("turnid"), "MsgId 与 TurnId 同值")
+  assert.match(String(headers.get("chatid")), /^chat-/)
 })
 
 test("passthrough 仍逐字节原样（回归）", async () => {

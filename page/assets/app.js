@@ -14,9 +14,7 @@ const state = { accounts: [], tasks: new Map(), invites: new Map(), route: new M
   // 余额缓存的时间戳（服务端 updatedAt）
   cacheAt: 0,
   // 路由状态的时间戳（服务端 /api/route-state 的 fetchedAt）
-  routeAt: 0,
-  // 免费巡检任务（0 积分）
-  patrol: { jobId: "", running: false, done: 0, total: 0, updated: 0, kept: 0, stopped: "" } }
+  routeAt: 0 }
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c])
 const num = (n) => n == null ? "—" : Number(n).toLocaleString("zh-CN")
 
@@ -485,92 +483,6 @@ async function applyJudgement() {
     if (button) button.disabled = false
   }
 }
-// ── 免费巡检（0 积分） ──────────────────────────────────────────────────
-//
-// 只读模型目录 + 账本/流量，**不发 chat、不扣积分**。进度与结束文案都要写清
-// 「判定更新 / 未变」两组数字，让用户知道这次到底改了什么。
-const PATROL_POLL_MS = 2000
-let patrolTimer = 0
-
-function patrolText() {
-  const p = state.patrol
-  if (!p?.jobId && !p?.running) return ""
-  if (p.running) return `巡检中 ${p.done}/${p.total} · 判定更新 ${p.updated} · 未变 ${p.kept}`
-  if (p.stopped) return `巡检被熔断停止：${p.done}/${p.total}（上游限流，剩余账号未调用）`
-const extra = [p.counts?.expired ? `登录失效 ${p.counts.expired}` : "", p.counts?.exhausted ? `积分不足 ${p.counts.exhausted}` : ""].filter(Boolean).join(" · ")
-  const applied = p.applied ? " · 已应用（magpie 列表已重拉）" : p.applyError ? ` · 应用失败：${p.applyError}（可手动点『应用判定』）` : ""
-  return `巡检完成 ${p.done}/${p.total} · 新判定 ${p.updated} · 保持不变 ${p.kept}${extra ? " · " + extra : ""} · 花费 0 积分${applied}`
-}
-
-function renderPatrol() {
-  const hint = $("#patrol-hint")
-  if (hint) hint.textContent = patrolText()
-  const button = $("#route-patrol")
-  if (button) button.disabled = state.busy || state.patrol?.running === true
-}
-
-function schedulePatrolPoll(delay = PATROL_POLL_MS) {
-  clearTimeout(patrolTimer)
-  patrolTimer = setTimeout(() => { void pollPatrol() }, delay)
-}
-
-async function startPatrol() {
-  if (state.busy || state.patrol?.running) return
-  const uids = [...state.selected]
-  try {
-    const started = await api("/api/route-patrol-batch", uids.length ? { uids } : {})
-    state.patrol = { jobId: started.jobId, running: true, done: 0, total: started.total, updated: 0, kept: 0, stopped: "" }
-    log("巡检", `开始免费巡检 ${started.total} 个账号（只读目录/账本，0 积分）`)
-    render()
-    void pollPatrol()
-  } catch (e) {
-    log("巡检", `巡检没有启动：${e.message}`)
-    toast(e.message, true)
-  }
-}
-
-async function pollPatrol() {
-  const current = state.patrol
-  if (!current?.running || !current.jobId) return
-  let job
-  try {
-    job = (await api("/api/route-patrol-batch?jobId=" + encodeURIComponent(current.jobId))).job
-  } catch (e) {
-    state.patrol = { ...current, running: false, jobId: "" }
-    log("巡检", `进度查询失败：${e.message}`)
-    render()
-    return
-  }
-// 巡检汇总要能分别报「登录失效 / 积分不足」两类（都来自 results 的 verdict）
-  const counts = { expired: 0, exhausted: 0 }
-  for (const entry of Object.values(job.results ?? {})) {
-    if (!entry || typeof entry !== "object" || entry.error || entry.keep) continue
-    if (entry.verdict === "expired") counts.expired += 1
-    if (entry.verdict === "exhausted") counts.exhausted += 1
-  }
-  state.patrol = { ...current, running: Boolean(job.running), done: job.done, total: job.total, updated: job.updated ?? 0, kept: job.kept ?? 0, stopped: job.stopped || "", counts, applied: job.applied === true, applyError: job.applyError || "" }
-  // 判定变化的行记一条日志（谁从什么变成什么、为什么）
-  for (const [uid, entry] of Object.entries(job.results ?? {})) {
-    if (!entry || typeof entry !== "object" || entry.error || entry.keep) continue
-    if (!entry.verdict) continue
-    const before = state.route.get(uid)?.verdict ?? "未检测"
-    if (before === entry.verdict) continue
-    const account = state.accounts.find((a) => a.uid === uid)
-    log("巡检", `${account?.phone || account?.name || uid} 由 ${before} 变为 ${entry.verdict}（${entry.reason || "无原因"}）`)
-  }
-  if (state.patrol.running) {
-    render()
-    schedulePatrolPoll()
-    return
-  }
-  clearTimeout(patrolTimer)
-  // ⚠ 结束强制重读：巡检会写 catalogOkAt / 改判定，统计卡必须重新对齐
-  try { await routeStates() } catch {}
-  // 汇总文案与 hint 保持一致：登录失效 / 积分不足分别报数
-  log("巡检", `免费巡检完成：${state.patrol.done}/${state.patrol.total}，判定更新 ${state.patrol.updated}，未变 ${state.patrol.kept}，登录失效 ${state.patrol.counts?.expired ?? 0}，积分不足 ${state.patrol.counts?.exhausted ?? 0}（0 积分）`)
-  state.patrol = { ...state.patrol, running: false, jobId: "" }
-  render()
-}
 // ── 刷新任务：打开面板只读缓存，刷新必须用户点 ──────────────────────────
 //
 // 打开面板**绝不**自动查余额/任务/邀请码（184 个号全量打上游 = 限流 = 成批失败）。
@@ -1001,7 +913,6 @@ $("#logs-copy").addEventListener("click", async () => {
   } catch { toast("复制失败，剪贴板不可用或权限被拒绝，请在日志页手动选择复制。", true) }
 })
 // ⚠ 危险操作：先二次确认。清空的只是**检测结果**（不会碰 magpie 的账号数据）
-$("#route-patrol").addEventListener("click", () => { void startPatrol() })
 $("#route-apply").addEventListener("click", () => { void applyJudgement() })
 $("#route-reset").addEventListener("click", () => {
   const total = state.route.size || state.accounts.length
@@ -1152,7 +1063,6 @@ numberSetting("#setting-batch-concurrency", 1, undefined, "batchConcurrency")
 numberSetting("#setting-balance-concurrency", 1, undefined, "balanceConcurrency")
 numberSetting("#setting-tasks-concurrency", 1, undefined, "tasksConcurrency")
 numberSetting("#setting-invite-concurrency", 1, undefined, "inviteConcurrency")
-numberSetting("#setting-patrol-concurrency", 1, undefined, "patrolConcurrency")
 // 间隔是「保护」不是并发：0 = 不等待，上限 5000ms
 numberSetting("#setting-gap-ms", 0, 5000, "gapMs")
 numberSetting("#setting-ledger-reads", 1, 5, "ledgerReads")

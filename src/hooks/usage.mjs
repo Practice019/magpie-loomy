@@ -10,6 +10,13 @@
 // 不会写回缓存」。积分网关直接能查，两个缺陷同时消失。
 //
 // 缓存只在网关请求失败时当兜底 —— 并且**如实标注它可能过期**。
+//
+// # T-38 只删了一件事：by-turn 那条判定来源
+//
+// 原来「这一轮落在哪个模型」要靠 by-turn 回查（发一次计费 chat + 轮询账本），
+// 现在不用了：SSE 每个 chunk 自带 `model`，loader 旁路读取即可
+// （`src/hooks/loader.mjs` 的 `noteServedModel`）。**额度读取本身保持原样**：
+// 用户明确要求「usage 这些也不要改」。
 
 import { fetchPointsSnapshot, fetchTasks } from "../points.mjs"
 import { usageFromPoints, tasksSummary, QUOTA_PREFIX, STOP_PREFIX, NOTE_PREFIX } from "../usage.mjs"
@@ -20,11 +27,11 @@ import { accountKeys, accountRoute, cooldownOf } from "./loader.mjs"
  * 构建 `auth.usage` 钩子。
  *
  * @param {{baseUrl: string, fetchImpl?: typeof fetch, clientStoreDir?: string, log?: object,
- *   configDir?: string, routeStore?: any}} opts
+ *   configDir?: string, routeStore?: any, now?: () => number}} opts
  *   `configDir` / `routeStore`：读「这个账号是不是被上游限制了」。
  * @returns {(getAuth: () => Promise<any>) => Promise<object>}
  */
-export function makeUsageHook(opts) {
+export function makeUsageHook(opts = {}) {
   const baseUrl = opts.baseUrl
   const doFetch = opts.fetchImpl ?? ((...args) => globalThis.fetch(...args))
   const log = opts.log ?? console
@@ -155,14 +162,18 @@ export function makeUsageHook(opts) {
    *	① **不要补 `used`**：一旦带上 `used`，它就会进额度排序；想靠它「打满额度」
    *	   就等于伪造「这个号没额度了」。
    *	② **不要加 `amount` / `limit`**：会被算成真额度占比，显示成奇怪百分比。
-   *	③ 顶层**绝不**为本说明写 `error`（AGENTS.md 坑 #17）—— 例外只有
-   *	   `expiredResult()` 那一处，且那里写的是登录问题本身。
+   *	③ 顶层**绝不**为本说明写 `error`（AGENTS.md 坑 #17）—— 唯一的例外是
+   *	   登录失效那一条 `signIn=expired`（它写的是登录问题本身，不是附加信息）。
    *
    * 没有判定（模块缺失 / 凭证里一个键都没有 / 判定不是 routed/expired）时
    * **原样返回**：多一条窗口就等于给所有账号一起贴了标签。
    *
    * @param {any} result usageFromPoints 的产出（或错误形状）
    * @param {any} auth
+   * @param {{available?: number, availableKnown?: boolean, permanent?: number,
+   *   permanentKnown?: boolean, daily?: number, dailyKnown?: boolean}} [points]
+   *   账本快照（**只有面板刷新那条路**才会传；`auth.usage` 读缓存时不传 —— 
+   *   缓存里已经是算好的窗口，再拿它反推「余额为 0」等于二次解释）。
    * @returns {Promise<any>}
    */
   /**
@@ -225,7 +236,8 @@ export function makeUsageHook(opts) {
    *
    * @param {any} result usageFromPoints 的产出（或错误形状）
    * @param {any} auth
-   * @param {any} [points] 账本快照（用于余额判断）
+   * @param {any} [points] 账本快照（**只有面板刷新那条路**会传；`auth.usage`
+   *   读缓存时不存在 —— 那时 `budgetOf` 走「真的不知道 → 不动」那一档）
    * @returns {Promise<any>}
    */
   async function withRouteWindow(result, auth, points) {

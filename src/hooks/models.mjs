@@ -1,13 +1,30 @@
-// models.mjs 每条账号的模型目录 —— 目录的**正源**。
+// models.mjs 模型目录 —— 目录的**正源**。
 //
-// # 为什么不能只靠 config 里的静态表
+// # 目录是 **provider 级**的，不是账号级的（这一条是 T-38 的核心修正）
 //
-// 实测：上游**按账号权限下发不同模型集**。同一个上游的两个号给出的模型集合
-// 只有部分交集（一个号 10 个、另一个号另一组）。所以：
+// 曾经这里每个账号各拉一次 `/api/v1/models`，零缓存：
 //
-//	静态表        冷启动兜底（登录前 / 全部拉取失败时）
-//	provider.models 每个账号问一次，取该账号真实的目录
-//	magpie         再把多个账号的并集拿去展示与路由
+//	301 个账号 × 每次 magpie 重读模型列表 = 301 次请求；
+//	开发者一天重启 8 次 ≈ 2400 次。
+//
+// 服务端判成**批量探测** ⇒ 风控 ⇒ session 失效（实测 19 个 expired，18 个是
+// session-expired）。**掉号的根因就是我们自己打的这些请求。**
+//
+// 但模型列表对所有账号相同（是 provider 的属性），按账号问一遍毫无必要。
+// 现在的读取顺序（也是用户的明确要求：「更新缓存我们控制不要自动」「不会过期」
+// 「重启不要发请求」）：
+//
+//	① 「这个号不能接活」的判定（目录置空）—— 只读本地状态文件，零上游
+//	② 文件缓存命中 → 直接返回，**绝不请求上游**（`src/models-cache.mjs`，无 TTL）
+//	③ 未命中 → 整个 provider 只拉**一次**（模块级 in-flight 去重）
+//	④ 拉成功 → 写缓存 → 返回
+//	⑤ 拉失败 → 回退静态表，**不写缓存**（下次还能重试）
+//
+// # 为什么静态表只是冷启动兜底
+//
+// 实测上游**按账号权限下发不同模型集**（一个号 10 个、另一个号另一组）。
+// 所以真正准确的目录必须来自一次真实的 `/models`；但**一次就够**，静态表负责
+// 「还没拉过 / 拉失败 / 未登录」这三种情况，保证界面上不会一个模型都没有。
 //
 // # 失败时必须回退而不是抛空
 //
@@ -53,6 +70,7 @@ import { PROVIDER, DEFAULT_BASE_URL, MODELS_PATH } from "../constants.mjs"
 import { modelsAuth } from "./../auth-headers.mjs"
 import { parseNameMultiplier } from "../multipliers.mjs"
 import { availableModels, IMAGE_MODEL_IDS } from "../models.mjs"
+import { readCachedModels, writeModelsCache } from "../models-cache.mjs"
 // 路由判定的读取器官在 loader（它是 `accountKeys`/`accountRoute` 的所有者）。
 // 依赖方向：hooks/models → hooks/loader → src/{prepare-body,upstream-facts}，
 // 没有回边，也不会反向摸到 index.mjs。
@@ -60,6 +78,37 @@ import { accountKeys, accountRoute } from "./loader.mjs"
 
 /** 拉目录的超时（一次目录请求不该占住太久）。 */
 const CATALOG_TIMEOUT_MS = 15_000
+
+/**
+ * 模块级 in-flight 去重表：`baseUrl` → **正在飞**的 Promise<any[]>。
+ *
+ * # 为什么必须是**模块级**
+ *
+ * `provider.models` 是**每个账号调一次**的（magpie 的模型列表钩子）。301 个
+ * 账号并发进来时，如果去重表挂在 hook 实例上那是 301 份；挂在模块上才是 1 份
+ * ⇒ **整个 provider 只产生 1 次上游请求**。
+ *
+ * # ⚠ 它只在**在飞**那一刻有意义（真机回归过的坑）
+ *
+ * 第一版把它当永久缓存（成功之后也留着）。后果有两个，都很安静：
+ *
+ *	· **换号就串目录**：第二个账号（也可能是另一份配置 / 另一个插件实例）
+ *	  进来时拿到的是上一个请求的 Promise ⇒ 目录属于别人；
+ *	· 把「缓存」这个职责从**文件缓存**手里偷走了 —— 于是刷新文件的语义失效
+ *	  （删了缓存文件也不生效，因为内存里还有一份），这与用户的
+ *	  「更新缓存我们控制」直接冲突。
+ *
+ * 现在的约定：**Promise 一结束就从表里删掉**（成功、失败都删）。
+ * 授权状态只存放在 `src/models-cache.mjs` 的文件里 —— 两个缓存源 = 两份真源。
+ *
+ * @type {Map<string, Promise<any[]>>}
+ */
+const inflight = new Map()
+
+/** 仅供测试：清空 in-flight 表（同一进程内跨用例隔离）。 */
+export function resetCatalogInflight() {
+  inflight.clear()
+}
 
 /**
  * 构建 `provider.models` 钩子。
@@ -127,7 +176,13 @@ export function makeModelsHook(opts = {}) {
     }
 
     try {
-      const live = await fetchCatalog({ baseUrl, session: auth.access, fetchImpl: doFetch, signal: AbortSignal.timeout(CATALOG_TIMEOUT_MS) })
+      const live = await catalogOnce({
+        baseUrl,
+        configDir,
+        session: auth.access,
+        fetchImpl: doFetch,
+        log,
+      })
       if (!live || live.length === 0) return toMagpieModels(provider, staticEntries())
       return toMagpieModels(provider, live.map(withMultiplier))
     } catch (e) {
@@ -135,6 +190,68 @@ export function makeModelsHook(opts = {}) {
       log.warn?.(`loomy: 拉取实时模型目录失败，回退静态表: ${e?.message ?? e}`)
       return toMagpieModels(provider, staticEntries())
     }
+  }
+}
+
+/**
+ * 取一次目录：**先文件缓存、再上游**，全程最多一次上游请求。
+ *
+ * # 这是唯一允许打 `/models` 的地方（provider 级）
+ *
+ * 顺序与理由见本文件顶部。这里额外做两件事：
+ *
+ *	· 并发去重：`inflight` 挂在**模块级**，301 个账号同时进来只产 1 次请求
+ *	  （表项在 Promise 结束时删掉 —— 它只表示「在飞」，缓存职责在文件里）；
+ *	· 失败不写缓存：`fetchCatalog` 抛错时直接向上抛，缓存里不会留下半份数据
+ *	  （否则一次网络抖动会被永久记住 —— 用户说的「不会过期」指的是**成功**的目录）。
+ *
+ * @param {{baseUrl: string, configDir: string, session: string,
+ *   fetchImpl: typeof fetch, log?: {warn?: Function}, now?: () => number}} opts
+ * @returns {Promise<any[]>}
+ */
+async function catalogOnce(opts) {
+  const key = String(opts.baseUrl ?? "").trim().replace(/\/+$/, "")
+  if (!key) throw new Error("baseUrl 为空")
+
+  // ① 文件缓存命中 ⇒ 直接返回，**绝不请求上游**
+  const cached = readCachedModels(opts.configDir, key)
+  if (cached !== null) return cached
+
+  // ② 未命中 ⇒ 同一个 baseUrl 的并发调用共享同一个 Promise（只打一次上游）
+  const running = inflight.get(key)
+  if (running) return running
+
+  const task = (async () => {
+    const list = await fetchCatalog({
+      baseUrl: opts.baseUrl,
+      session: opts.session,
+      fetchImpl: opts.fetchImpl,
+      signal: AbortSignal.timeout(CATALOG_TIMEOUT_MS),
+    })
+    // ③ 拉成功 ⇒ 写缓存。**空目录不写**：「一个都没给」极可能是这一刻的
+    //    风控/抖动，写进去就永远不重试了（用户要的「不会过期」针对的是
+    //    **成功**的目录）。没有 configDir 也不写（那是测试/无配置场景，
+    //    不该在磁盘上制造垃圾目录）。
+    if (Array.isArray(list) && list.length > 0 && opts.configDir) {
+      const wrote = writeModelsCache(opts.configDir, key, list, {
+        source: "live",
+        ...(typeof opts.now === "function" ? { now: opts.now } : {}),
+      })
+      if (!wrote.ok) opts.log?.warn?.(`loomy: 模型目录缓存写入失败（不影响本次结果）: ${wrote.error}`)
+    }
+    return list
+  })()
+
+  inflight.set(key, task)
+  try {
+    return await task
+  } catch (e) {
+    // ④ 拉失败 ⇒ 缓存一个字都不写，直接向上抛（调用方回静态表）
+    throw e
+  } finally {
+    // ⚠ 必须删：这个表只表示「此刻有人在飞」，不是缓存。
+    //   留着的后果是「换一个账号拿到上一个账号的目录」（真机回归过）。
+    if (inflight.get(key) === task) inflight.delete(key)
   }
 }
 

@@ -29,7 +29,8 @@
 //
 // # 刻意**不实现**的
 //
-//	auth.refresh   本上游没有 refresh token（session 不过期，见 src/credential.mjs）
+//	auth.refresh   本上游没有 refresh token（session 不过期，见 src/credential.mjs）。
+//	               T-38：钩子**整段不存在** —— 不是空壳，导出表里根本没有这个键。
 //	auth.checkin   本上游没有签到端点（日额度由服务端按自然日自动重置）
 //	tool           工具由 magpie 自己的 MCP 提供，与本上游无关
 //	*.middleware   请求改写由 loader 承担，不需要额外中间件
@@ -193,6 +194,7 @@ export const LoomyAuthPlugin = async (input = {}, options = {}) => {
     // `client.auth.set` 自己落盘（宿主一次登录只保存一个账号）。
     methods: makeMethods({ baseUrl, log, configDir, client: input?.client }),
     loader: makeLoaderHook({ configDir, log, bodyMode }),
+    // `auth.usage` 保持原样：先打积分网关、失败才回落本机缓存（用户明确要求「不要改」）。
     usage: makeUsageHook({ baseUrl, log, configDir }),
     // 界面开关（真源与破损方式见 `AUTH_OPTIONS` 的注释）。
     // **必须**挂在 `auth` 上：`optionsOf(a.auth)`，挂顶层等于没写。

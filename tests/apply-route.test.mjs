@@ -165,15 +165,17 @@ test("⑤ 找不到可执行文件 → ok:false 且提示「magpie 路径」，s
   }
 })
 
-test("⑥ autoApply 开关：true 时巡检结束后自动 apply，false 时不触发", async (t) => {
+test("⑥ autoApply 开关：true 时批量检测结束后自动 apply，false 时不触发", async (t) => {
+  // T-38：巡检（patrol）整段删除，`autoApply` 的触发点只剩**批量检测**。
+  // 语义不变：判定写完之后让 magpie 重拉模型列表；关掉就只诚实报 `applied:false`。
   const on = await fixture(t, { autoApply: true })
-  const startedOn = await on.call("POST", "/api/route-patrol-batch", { uids: ["u0"] })
+  const startedOn = await on.call("POST", "/api/route-check-batch", { uids: ["u0"] })
   await waitJob(on, startedOn.body.jobId)
   await tick()
-  assert.equal(on.fake.calls.length, 1, "autoApply:true 时巡检结束应自动 apply 一次")
+  assert.equal(on.fake.calls.length, 1, "autoApply:true 时检测结束应自动 apply 一次")
 
   const off = await fixture(t, { autoApply: false })
-  const startedOff = await off.call("POST", "/api/route-patrol-batch", { uids: ["u0"] })
+  const startedOff = await off.call("POST", "/api/route-check-batch", { uids: ["u0"] })
   const job = await waitJob(off, startedOff.body.jobId)
   await tick()
   assert.equal(off.fake.calls.length, 0, "autoApply:false 时不得触发 apply")
@@ -189,7 +191,7 @@ test("⑦ magpiePath 指向存在的文件 → 用它而不是候选列表", asy
 async function waitJob(f, jobId, timeoutMs = 20000) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
-    const job = (await f.call("GET", `/api/route-patrol-batch?jobId=${jobId}`)).body.job
+    const job = (await f.call("GET", `/api/route-check-batch?jobId=${jobId}`)).body.job
     if (!job.running) return job
     await tick()
   }

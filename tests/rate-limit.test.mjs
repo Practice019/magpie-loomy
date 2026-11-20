@@ -10,7 +10,8 @@
 //
 // # 所以三处必须改
 //
-//	A) 判定侧（route / patrol）：429 ⇒ `keep:true, rateLimited:true`，绝不产出 routed/expired
+//	A) 判定侧（route）：429 ⇒ `keep:true, rateLimited:true`，绝不产出 routed/expired
+//	   （T-38：`patrol.mjs` 随 by-turn / 巡检一并删除，判定侧只剩 `probeRoute`）
 //	B) 转发侧（loader）：429 原样透传，不重试、不改头、不打 warn
 //	C) 冷却（loader → usage）：429 后 60 秒内给这个号一条**带 resetsAt** 的
 //	   满额窗，让 magpie 短暂避开它，到期自动恢复（**不是**长期封禁）
@@ -18,8 +19,7 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 
-import { inspectCatalog, readLedgerRecords } from "../src/route.mjs"
-import { patrolAccount } from "../src/patrol.mjs"
+import { inspectCatalog, readLedgerRecords, probeRoute } from "../src/route.mjs"
 import { makeLoaderHook, cooldownOf } from "../src/hooks/loader.mjs"
 import { makeUsageHook } from "../src/hooks/usage.mjs"
 
@@ -67,19 +67,13 @@ test("route.inspectCatalog：目录 429 → rateLimited，**不**判 expired / u
   assert.notEqual(r.status, "ok", "没读到目录就不能说 ok")
 })
 
-test("patrol：429 → keep:true + rateLimited，不覆盖已有 clean", async () => {
+test("route.probeRoute：429 → unknown（reason no-ledger-records），不覆盖已有 clean", async () => {
+  // patrol 已随 by-turn / 巡检删除（T-38），同一条语义改由 probeRoute 的只读判定承载：
+  // 目录读不到 ⇒ 不判死；账本也读不到 ⇒ 只能是「这次没测清」。
   const up = upstream429()
-  const r = await patrolAccount({
-    baseUrl: BASE,
-    session: SESSION,
-    uid: UID,
-    fetchImpl: up.fetchImpl,
-    traffic: [],
-  })
-
-  assert.equal(r.keep, true, "限流时唯一正确的结论是「这次没测清，保留原状态」")
-  assert.equal(r.rateLimited, true, "要让面板/上层知道是限流而非账号问题")
-  assert.equal(r.verdict, undefined, "绝不能在 429 时产出 routed/expired")
+  const r = await probeRoute({ baseUrl: BASE, session: SESSION, fetchImpl: up.fetchImpl })
+  assert.equal(r.verdict, "unknown", "限流时绝不能产出 routed/expired")
+  assert.match(String(r.reason), /ledger/, "原因要指向「账本没读到」，而不是「账号坏了」")
 })
 
 // ── B) 转发：429 原样透传，不自愈 ──────────────────────────────────────

@@ -24,7 +24,6 @@ const EXPECTED_SETTINGS = Object.freeze({
   balanceConcurrency: 2,
   tasksConcurrency: 2,
   inviteConcurrency: 2,
-  patrolConcurrency: 2,
   gapMs: 300,
   autoApply: true,
   magpiePath: "",
@@ -323,13 +322,14 @@ test("设置拒绝非法值、额外字段及非法 JSON，写入失败不改变
     { routeConcurrency: 1.5 },
     { tasksConcurrency: 1.5 },
     { inviteConcurrency: 0 },
-    { patrolConcurrency: "3" },
     { balanceConcurrency: -1 },
     { gapMs: -1 },
     { gapMs: 9999 },
     { gapMs: 1.5 },
     { autoApply: "true" },
     { magpiePath: 123 },
+    // T-38：巡检接口整段删除，`patrolConcurrency` 不再是合法键（避免「存着不生效」）
+    { patrolConcurrency: 3 },
     // T-35：新开关只收布尔值
     { focusRefresh: "true" },
     { focusRefresh: 1 },
