@@ -27,7 +27,8 @@
 | 3 | 额度窗口不显示 / 路由把耗尽的账号顶到队首 | `windows[].used` 是**路由输入**。没有 `used` 的窗口只当文本；而 `used: 0` 会被当成「满额」 | `src/usage.mjs` |
 | 4 | 「免费额度」显示 0，但账号其实一直在成功请求 | `daysKnown` / `permanentKnown` 的 presence 标记不能丢 —— **「字段缺失」≠「值是 0」** | `src/points.mjs` 的 `fetchPointsSnapshot` |
 | 5 | 「我生成的邀请码」永远是空的 | 回执字段是 **`inviteCode`**，不是 `code`。猜错一个字段名 = 整块功能看起来没做且不报错 | `src/points.mjs` 的 `fetchInvitationCodes` |
-| 6 | 模型「能跑但收不了图」，或者把截图直发上游被拒 | 模型条目必须显式写 `attachment: false` 与 `modalities.input.image = false`。省掉 ≠ 按 text 处理，会退到 models.dev 按同名模型投票 | `src/hooks/config.mjs`、`src/hooks/models.mjs` |
+| 6 | 模型「能跑但收不了图」，或者把截图直发上游被拒 | 模型条目的能力**只能来自上游**（`capabilities` / `vision` / `input_modalities` → `mapUpstreamCapabilities`），且 `attachment` 与 `modalities.input.image` 必须同源。**不许写死 `false`**：写死之后 magpie 的「识图模型」下拉框里一个 loomy 模型都没有，路由组选它发图就卡死。上游没给能力字段时才回落 `["text"]`。省掉字段同样不行（≠ 按 text 处理，会退到 models.dev 按同名模型投票） | `src/hooks/models.mjs` 的 `mapUpstreamCapabilities` |
+| 6b | 发了图但上游收到的是一条纯文本请求 | loader 遇到 `messages[].content` 是**数组**（多模态）时必须原样透传，**不许裁剪 `image_url`**。`client-body` 只换 model/messages，不做内容整理 | `src/client-body.mjs`、`tests/multimodal-passthrough.test.mjs` |
 | 7 | 点了登录界面转圈很久 | `authorize()` 必须**立刻返回**，网络请求一律挪到 `callback()` / `ask()` 里。有测试钉死（`methods.test.mjs` 的「authorize 立刻返回」） | `src/hooks/methods.mjs` |
 | 8 | 插件页显示「已停止工作」 | 插件页 10 秒内必须和 bridge 握手。`page/gateway.html` 必须加载 `_magpie/bridge.js` | `page/gateway.html` |
 | 9 | 面板打开是空白 / 一片 404 | 插件页是**沙盒 iframe**（CSP `connect-src 'none'`），页面内不能 fetch。必须**导航**到 `page.service` 的地址，不能在沙盒里画 | `page/boot.js`、`server.mjs` |

@@ -182,6 +182,20 @@ export async function fetchCatalog(opts) {
       name: String(e?.name ?? ""),
       contextWindow: firstPositive(e?.context_window, e?.context_length),
       maxOutputTokens: firstPositive(e?.max_output_tokens, e?.max_tokens, e?.max_output_length),
+      // ── 能力声明**原样带走**，映射只发生在 toMagpieModels ──
+      //
+      // 实测（2026-11-20，`GET /api/v1/models`）上游给的是：
+      //
+      //	{"id":"DeepSeek-V4.1-Flash",
+      //	 "capabilities":{"reasoning":true,"vision":true,"function_calling":true,
+      //	                 "input_modalities":["text","image"],"output_modalities":["text"]}}
+      //
+      // 这里**不解析**：拉目录与解释目录是两件事，解释只有一处
+      // （{@link mapUpstreamCapabilities}），否则两边漂移时没人能发现。
+      capabilities: e?.capabilities,
+      // 个别条目把 vision 放在顶层（实测同一份响应里 `supportsImage: null` 与
+      // `capabilities.vision` 并存），两个位置都认。
+      supportsImage: e?.supportsImage,
     })
   }
   return out
@@ -230,11 +244,97 @@ function stripMultiplier(name) {
 }
 
 /**
+ * 上游能力声明 → magpie 的两组模态字段（**唯一一处映射**）。
+ *
+ * # 只认上游说的话，不猜
+ *
+ *	vision          `capabilities.vision === true`
+ *	                ∪ `capabilities.input_modalities` 含 `image`
+ *	                ∪ 顶层 `supportsImage === true`
+ *	模态数组         上游没给（或给了空数组）→ 回落 `["text"]`
+ *	toolcall        `capabilities.function_calling !== false`
+ *	reasoning       `capabilities.reasoning === true`
+ *
+ * # 为什么 vision 与模态数组要互相补齐
+ *
+ * 上游说 `vision: true` 但 `input_modalities` 里没写 `image` 时，两个字段会
+ * **自相矛盾**：magpie 看 `attachment`（或 `modalities.input`）只取其中一个，
+ * 于是同一份声明在不同 UI 上给出两个答案。这里把 `image` 补进模态数组，让
+ * 两组声明永远一致 —— 补的方向只有一个：vision 为真则 image 进列表。
+ *
+ * # 生图模型不走这里
+ *
+ * `IMAGE_MODEL_IDS` 的能力来自「它只能生图」这一条端点事实（见
+ * `src/models.mjs` 的实测表），与上游的文本能力无关。
+ *
+ * @param {{capabilities?: any, supportsImage?: boolean}} [entry] 上游条目（原始形状）
+ * @returns {{vision: boolean, toolcall: boolean, reasoning: boolean,
+ *   inputModalities: string[], outputModalities: string[],
+ *   input: {text: boolean, image: boolean, audio: boolean, video: boolean, pdf: boolean},
+ *   output: {text: boolean, image: boolean, audio: boolean, video: boolean, pdf: boolean}}}
+ */
+export function mapUpstreamCapabilities(entry) {
+  const raw = entry?.capabilities
+  const up = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {}
+
+  const inputModalities = stringList(up.input_modalities)
+  const outputModalities = stringList(up.output_modalities)
+
+  // 上游一个字都没说 → 纯文本。**不按模型名猜**（猜错的表现是发图卡死）。
+  const input = inputModalities.length > 0 ? inputModalities : ["text"]
+  const output = outputModalities.length > 0 ? outputModalities : ["text"]
+
+  const vision = up.vision === true || input.includes("image") || entry?.supportsImage === true
+  if (vision && !input.includes("image")) input.push("image")
+
+  return {
+    vision,
+    toolcall: up.function_calling !== false,
+    reasoning: up.reasoning === true,
+    inputModalities: input,
+    outputModalities: output,
+    input: modalityFlags(input),
+    output: modalityFlags(output),
+  }
+}
+
+/**
+ * 把模态字符串数组摊成 magpie 要的布尔对象。
+ *
+ * ⚠ 必须**显式写全**五个布尔值：省掉不等于「按 text 处理」——
+ * magpie 只认 `typeof input.image === "boolean"`，没写就是「厂商未表态」，
+ * 会退到 models.dev 按裸模型 id 投票（同名模型在别家标过 image 就会误判）。
+ *
+ * @param {string[]} mods
+ * @returns {{text: boolean, image: boolean, audio: boolean, video: boolean, pdf: boolean}}
+ */
+function modalityFlags(mods) {
+  const has = (m) => mods.includes(m)
+  return { text: has("text"), image: has("image"), audio: has("audio"), video: has("video"), pdf: has("pdf") }
+}
+
+/** 只留非空字符串，并去重（上游偶尔把同一个模态写两遍）。 */
+function stringList(value) {
+  if (!Array.isArray(value)) return []
+  /** @type {string[]} */
+  const out = []
+  for (const v of value) {
+    if (typeof v !== "string") continue
+    const s = v.trim()
+    if (s && !out.includes(s)) out.push(s)
+  }
+  return out
+}
+
+/**
  * 把条目转成 magpie `provider.models` 要的形状（OpenCode 的 `Model`）。
  *
  * ⚠ 这里的字段名是 **`toolcall`**（无下划线），与 `config` 钩子里的
  * `tool_call`（带下划线）不同。两处拼写不同，写错不会报错，
  * 只会让「能不能调工具」静默为假。
+ *
+ * ⚠ 能力**全部来自上游**（`mapUpstreamCapabilities`）：本函数不按模型名、
+ * 不按静态表猜任何一项。上游没声明 = 纯文本。
  *
  * @param {any} provider 宿主给的 provider（含它已有的 models，可展开复用）
  * @param {Array<any>} entries
@@ -248,6 +348,26 @@ function toMagpieModels(provider, entries) {
   for (const e of entries) {
     const prior = base[e.id] ?? {}
     const imageOnly = e.imageOnly === true || IMAGE_MODEL_IDS.includes(e.id)
+    const up = mapUpstreamCapabilities(e)
+
+    // 生图模型：**只能生图**是端点事实（chat 会 404），不是上游的文本能力。
+    // 所以它一律写成「收文本 → 出图片」，并且不读上游的 vision。
+    const capabilities = imageOnly
+      ? {
+          ...(prior.capabilities ?? {}),
+          toolcall: false,
+          reasoning: false,
+          input: { text: true, image: false, audio: false, video: false, pdf: false },
+          output: { text: false, image: true, audio: false, video: false, pdf: false },
+        }
+      : {
+          ...(prior.capabilities ?? {}),
+          toolcall: up.toolcall,
+          reasoning: up.reasoning,
+          // ⚠ 必须显式写 modality 布尔值（见 modalityFlags 的说明）
+          input: up.input,
+          output: up.output,
+        }
 
     /** @type {any} */
     const model = {
@@ -258,17 +378,13 @@ function toMagpieModels(provider, entries) {
         context: e.contextWindow || prior?.limit?.context || 0,
         output: e.maxOutputTokens || prior?.limit?.output || 0,
       },
-      capabilities: {
-        ...(prior.capabilities ?? {}),
-        toolcall: !imageOnly,
-        reasoning: false,
-        // ⚠ 必须显式写 modality 布尔值：省掉不等于「按 text 处理」
-        input: { text: true, image: false, audio: false, video: false, pdf: false },
-      },
+      capabilities,
       modalities: imageOnly
         ? { input: ["text"], output: ["image"] }
-        : { input: ["text"], output: ["text"] },
-      attachment: false,
+        : { input: up.inputModalities, output: up.outputModalities },
+      // magpie 的两条「收不收图」判据：两处同源，避免一个说能、一个说不能。
+      attachment: imageOnly ? false : up.vision,
+      supportsImage: imageOnly ? false : up.vision,
     }
     // 官方倍率（解析不到就不给 —— 没有官方数据就不显示，不估算）
     if (typeof e.rate === "number" && e.rate > 0) model.rate = e.rate

@@ -17,7 +17,7 @@
 // （由 provider.models 自己发），所以这里不用管它。
 
 import { prepareBody, modelOf } from "../prepare-body.mjs"
-import { signInVerdict, applySignInHeader } from "../upstream-facts.mjs"
+import { signInVerdict, applySignInHeader, SIGN_IN_HEADER } from "../upstream-facts.mjs"
 import { chatHeaders, sessionAffinity } from "../auth-headers.mjs"
 import { buildClientBody } from "../client-body.mjs"
 import { CLIENT_BODY_TEMPLATE } from "../client-body-template.mjs"
@@ -640,8 +640,26 @@ export function makeLoaderHook(opts = {}) {
       // 标错的代价是把一个健康账号打成「需要重新登录」，用户会去删一个好好的号。
       //
       // ⚠ 上游的业务失败也可能是 HTTP 200（`{"code":"100002","desc":"缺少 token"}`），
-      // 所以 200 也要看正文。
-      if (!resp.ok || resp.status === 200) {
+      // 所以 200 也要看正文 —— **但只看有界的 JSON**。
+      //
+      // # 为什么 200 + 流式**绝不能** peek（真机事故，T-28）
+      //
+      // 上一版无条件 `!resp.ok || resp.status === 200` → 所有 200 都 peek，
+      // 而 peek 当时是 `clone().text()` 读到 EOF。`resp.clone()` 与原响应共享底层
+      // 流：clone 读到 EOF ⇒ 原分支的 chunk 被全部缓冲、在宿主开始读时一次性放出
+      // ⇒ 首 token 与末 token 的到达时间差 ≈ 0 ⇒ magpie 的 decode_ms / decode_tps
+      // 全算不出来（实测：loomy 所有账号 decode 均速为空，其它上游正常；ttft 不受
+      // 影响，因为首字节到达时间仍然真实）。
+      //
+      // 现在两道闸：① 只有「非 2xx」或「200 + application/json」才值得看正文；
+      //             ② 看就**整读**（JSON 有界、非流），绝不 cancel（见 peekVerdict）。
+      const contentType = resp.headers.get("content-type") ?? ""
+      const looksJson = /application\/json/i.test(contentType)
+      // 200 要看正文的唯一正当理由：上游把业务失败塞进 200（本上游已知
+      // `{"code":"100002"}`）。那类响应 Content-Type 是 application/json
+      // （Content-Length 有界、非流式）；流式（text/event-stream）的 200 **绝不能碰**。
+      const worthPeeking = !resp.ok || (resp.status === 200 && looksJson)
+      if (worthPeeking) {
         const verdict = await peekVerdict(resp)
         if (verdict) {
           const headers2 = new Headers(resp.headers)
@@ -665,21 +683,54 @@ export function makeLoaderHook(opts = {}) {
   }
 }
 
+/** 判断登录态时最多看多少字节正文（够认出错误 JSON / 一句话文案即可）。 */
+export const PEEK_LIMIT_BYTES = 4096
+
 /**
- * 偷看响应正文的前若干字节，判断登录态语义。
+ * 看响应正文，判断「这次失败是不是登录问题」。
  *
- * ⚠ 用的是 `resp.clone()` —— 原响应体必须原样交回宿主，绝不能因为
- * 我们看了一眼就把流吃掉。
+ * # 为什么**整读**是对的，而「限量读 + cancel」是错的（T-29 真机事故）
+ *
+ * 上一版用 `resp.clone().body.getReader()` 读满 4 KB 再 `reader.cancel()`。
+ * `Response.clone()` 的两个分支**共享同一条底层流**：取消 clone 分支的
+ * reader 会波及**原分支**（上游 source 被 cancel），原响应从此再也产不出
+ * 数据 —— magpie 读流永远等不到结束，测试直接 15s 超时。
+ *
+ * 能走到这里的前提（调用点那两道闸，见 loader 里的 `worthPeeking`）：
+ * **非 2xx** 或 **200 + application/json**。这两类响应都有 `Content-Length`、
+ * 体积小、**不是流**，所以整读永远是安全的。真正不能碰的是
+ * `text/event-stream` 的 200 —— 那种情况**一次都不 clone**。
+ *
+ * # 两条红线
+ *
+ *	1. `text/event-stream` 的 200：**一次都不 clone**（clone 读 EOF 会压平
+ *	   时间轴，cancel 会连坐原流）
+ *	2. 一旦 clone，就**只能整读，不能 cancel**（cancel 会连带取消原分支）
  *
  * @param {Response} resp
  * @returns {Promise<"expired"|"kept"|null>}
  */
-async function peekVerdict(resp) {
+export async function peekVerdict(resp) {
+  const status = Number(resp?.status ?? 0)
+
+  // ① 401/403：只看状态码，不碰流
+  if (status === 401 || status === 403) {
+    const hinted = String(resp?.headers?.get?.(SIGN_IN_HEADER) ?? "").trim().toLowerCase()
+    if (hinted === "expired" || hinted === "kept") return hinted
+    return "expired"
+  }
+  // ② 5xx：账号级失败，状态码已说明一切
+  if (status >= 500) return "kept"
+
+  // ③ 其余（只可能是 JSON / 错误体）：整读。JSON 有界，且不是流。
+  //    ⚠ 绝不要用 clone().body.getReader() + cancel：取消会波及原分支，
+  //    让原响应产不出数据（真机表现为 magpie 读流永远等不到结束）。
+  let text = ""
   try {
-    const text = await resp.clone().text()
-    return signInVerdict(resp.status, text.slice(0, 4096))
+    text = await resp.clone().text()
   } catch {
-    // 流已被读 / 不是文本：不表态，交给宿主默认判据
+    // 流已被读过 / 不是文本：不表态，交给宿主默认判据
     return null
   }
+  return signInVerdict(status, text.slice(0, PEEK_LIMIT_BYTES))
 }
