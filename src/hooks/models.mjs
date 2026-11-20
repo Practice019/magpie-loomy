@@ -15,6 +15,8 @@
 // 「重启不要发请求」）：
 //
 //	① 「这个号不能接活」的判定（目录置空）—— 只读本地状态文件，零上游
+//	   ⚠ **必须排在 ② 之前**：缓存命中会直接返回，判定写在它后面就永远轮不到
+//	   （T-44 真机回归：210 个 routed 号被缓存里的旧目录填了回来）
 //	② 文件缓存命中 → 直接返回，**绝不请求上游**（`src/models-cache.mjs`，无 TTL）
 //	③ 未命中 → 整个 provider 只拉**一次**（模块级 in-flight 去重）
 //	④ 拉成功 → 写缓存 → 返回
@@ -111,6 +113,47 @@ export function resetCatalogInflight() {
 }
 
 /**
+ * 「这条置空日志已经打过」的键集合（模块级，见 {@link logOnce}）。
+ *
+ * @type {Set<string>}
+ */
+const warned = new Set()
+
+/** 仅供测试：清空日志节流表（同一进程内跨用例隔离）。 */
+export function resetModelsWarned() {
+  warned.clear()
+}
+
+/**
+ * 同一进程内，同一条「置空原因 × 同一个账号」只打**一次**日志。
+ *
+ * # 为什么要节流
+ *
+ * `provider.models` 是**每读一次模型列表**就调一轮的（真机 301 个账号）。
+ * 一条置空日志在每轮里重复 301 次，会把「谁被置空、为什么」彻底淹没 ——
+ * 用户要的是「从日志判断」，不是一屏重复。
+ *
+ * 键是 `原因|账号`：换账号、换结论都会再打一条，所以信息不会丢。
+ * 表是模块级的：**进程重启会重新打一遍**（这是想要的 —— 重启后排障人
+ * 从零开始看日志）。
+ *
+ * @param {any} log
+ * @param {string} kind `verdict` 或 `"routecheck-off"`
+ * @param {string} [key] 命中的账号键
+ * @param {string} message
+ */
+function logOnce(log, kind, key, message) {
+  const id = `${kind}|${String(key ?? "")}`
+  if (warned.has(id)) return
+  warned.add(id)
+  try {
+    log.warn?.(message)
+  } catch {
+    /* 日志失败不是业务失败 */
+  }
+}
+
+/**
  * 构建 `provider.models` 钩子。
  *
  * @param {{baseUrl?: string, fetchImpl?: typeof fetch, log?: {warn: Function},
@@ -136,42 +179,48 @@ export function makeModelsHook(opts = {}) {
       return toMagpieModels(provider, staticEntries())
     }
 
-    // ── 空目录：这个号不该再收到任何请求 ──
-    // 先判再拉：既省一次上游请求，也不给宿主任何「其实它能用」的暗示。
+    // ── ① 置空判定：这个号不该再收到任何请求（**排在缓存之前**）──
+    //
+    // ⚠ 顺序是这个功能的全部。`catalogOnce` 的第一步一旦命中
+    // `<configDir>/loomy-models-cache.json` 就**直接返回**（用户要求「不会过期」
+    // 「重启不要发请求」），判定若写在它后面就永远轮不到 —— 真机症状正是这样：
+    // 210 个 routed 号带着缓存里的 9 个模型回到面板，可用号显示 281 而实际只有 71
+    // （`expired` / `exhausted` 因为当时判定在前，没受影响）。
+    //
     // 三种结论都置空：
     //	routed    —— 上游把整号改路由（付 2× 拿 spark），发出去也是白付钱
     //	expired   —— session 已过期，发出去只会 401，白耗一次换号
     //	exhausted —— 余额不足（402），发出去只会再 402
     // ⚠ 这里返回 `{}` 而不是「删掉某个模型」：整号坏（实测 GLM / qwen / 两个
     // deepseek 全部落到 spark-x2.6-low），只删一个模型等于让别的模型继续被换掉。
+    // ⚠ `{}` 是 magpie 认的「该号无模型 ⇒ 路由跳过」，不是「这次没拉到」。
     const hit = await lookupRoute(auth, { configDir, routeStore: storeOpt })
     const verdict = hit?.entry?.verdict
+    const served = String(hit?.entry?.servedModel ?? "").trim() || "上游其它模型"
     // `routecheck` 关掉时，只放过 `routed`（见 opts 注释）；仍在日志里留一句，
     // 否则"我明明关了开关，号还是被换了模型"这件事查起来没有线索。
     const routed = verdict === "routed"
     const blocking = verdict === "expired" || verdict === "exhausted" || (routed && routeCheck)
     if (routed && !blocking) {
-      try {
-        log.warn?.(
-          `loomy: 账号 ${hit.key} 已被上游限制（全部模型实际由 ${String(hit.entry?.servedModel ?? "").trim() || "上游其它模型"} 服务），` +
-            `但界面开关 routecheck 已关闭 —— 目录照常列出，路由仍会派活`,
-        )
-      } catch {
-        /* 日志失败不是业务失败 */
-      }
+      logOnce(
+        log,
+        "routecheck-off",
+        hit.key,
+        `loomy: 账号 ${hit.key} 已被上游改路由（全部模型实际由 ${served} 服务），` +
+          `但界面开关 routecheck 已关闭 —— 目录照常列出，路由仍会派活`,
+      )
     }
     if (blocking) {
-      try {
-        log.warn?.(
-          verdict === "expired"
-            ? `loomy: 账号 ${hit.key} 登录已失效（session 过期），目录置空（不派活）`
-            : verdict === "exhausted"
-              ? `loomy: 账号 ${hit.key} 积分余额不足（上游 402），目录置空（不派活）`
-              : `loomy: 账号 ${hit.key} 已被上游限制（全部模型实际由 ${String(hit.entry?.servedModel ?? "").trim() || "上游其它模型"} 服务），目录置空（不派活）`,
-        )
-      } catch {
-        /* 日志失败不是业务失败 */
-      }
+      logOnce(
+        log,
+        verdict,
+        hit.key,
+        verdict === "expired"
+          ? `loomy: 账号 ${hit.key} 登录已失效（session 过期），目录置空（不派活）`
+          : verdict === "exhausted"
+            ? `loomy: 账号 ${hit.key} 积分余额不足（上游 402），目录置空（不派活）`
+            : `loomy: 账号 ${hit.key} 已被上游改路由（全部模型实际由 ${served} 服务），目录置空（不派活）`,
+      )
       return {}
     }
 

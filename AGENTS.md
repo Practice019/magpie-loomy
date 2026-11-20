@@ -49,6 +49,7 @@
 | 23 | 邀请码「用了 6 次、上限 20」被标成已用完 | 判据是 `status === "exhausted"` **或** `maxUses > 0 && usedCount >= maxUses`。⚠ `maxUses: 0` 是**不限次数**，不能被 `?? 1` 吞成 1 | `page/assets/app.js` 的 `isCodeExhausted`、`src/points.mjs` |
 | 24 | 新手任务**全部都显示未完成**，但账号其实早就 8/8 了 | `/onboarding/tasks` 的 `data.tasks` 是**对象**（`{key: true}`），**不是数组**。只认数组会把「8 项全完成」解析成 `{}` ⇒ 界面显示 0/8。⚠ 同级还有 `earned` / `total` 两个数字，不能当任务状态混进来 | `src/points.mjs` 的 `fetchTasks` |
 | 25 | 按钮点了没反应（前端事件绑不上） | HTML 的 `id` 与 JS 的 `$("#id")` 必须逐字对齐。本仓库有一次写成 `bind-start` vs `bind-run`。改完跑一遍 id 对齐检查 | `page/index.html`、`page/assets/app.js` |
+| 26 | 面板说可用号很多，实际能用的就那么几个（routed 号又有模型了） | **置空判定必须排在缓存查询之前**。`catalogOnce` 命中 `loomy-models-cache.json` 会直接返回，判定写在它后面就永远轮不到（真机：281 vs 71）。判据：`tests/models-route-blank.test.mjs` 的 T44-2（先写缓存、再断言 `{}`）；真机核对跑 `node scripts/route-blank-stats.mjs` | `src/hooks/models.mjs`、`scripts/route-blank-stats.mjs` |
 
 ---
 
