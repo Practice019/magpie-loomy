@@ -175,7 +175,15 @@ export const LoomyAuthPlugin = async (input = {}, options = {}) => {
     ? String(options?.bodyMode ?? "").trim() || DEFAULT_BODY_MODE
     : DEFAULT_BODY_MODE
   // `routecheck`：关 = 即使上游改了路由也不置空目录（仍会被派活）
-  const routeCheck = option("routecheck", true)
+  //
+  // ⚠ **必须惰性读**（真机事故 2026-11-21）：宿主是「先调插件工厂、后登记钩子」
+  // （`host.js` L1526 调工厂、L1544 才 `hooks.push`），而 `option()` 内部查的是
+  // `auths()`（L1760，只认已登记的钩子）⇒ 工厂期问出来的值是
+  // **「未声明的键 = false」**，不是用户设置。表现：`routecheck` 恒为关，
+  // 206 个被上游改路由的号一直列着 9 个模型、可用号虚高到 281，
+  // 而日志里刷了几千行「但界面开关 routecheck 已关闭」。
+  // 现在把「读开关」推迟到钩子被调用时（那时钩子早已登记）。
+  const routeCheckNow = () => option("routecheck", true)
 
   // `configDir` 同时喂给四条钩子：登录态（methods）、请求（loader）、
   // 额度窗口（usage）、模型目录（provider.models）。
@@ -222,8 +230,9 @@ export const LoomyAuthPlugin = async (input = {}, options = {}) => {
     auth,
     provider: {
       id: PROVIDER,
-      // `routeCheck` 开关：关掉时 models 钩子不再因「上游改路由」返回空目录
-      models: makeModelsHook({ baseUrl, log, configDir, routeCheck }),
+      // `routeCheck` 开关：关掉时 models 钩子不再因「上游改路由」返回空目录。
+      // 传函数而不是布尔值 —— 见上面 `routeCheckNow` 的注释（工厂期读不到用户设置）。
+      models: makeModelsHook({ baseUrl, log, configDir, routeCheck: routeCheckNow }),
     },
   }
 }

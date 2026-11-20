@@ -170,7 +170,13 @@ export function makeModelsHook(opts = {}) {
   const log = opts.log ?? console
   const configDir = String(opts.configDir ?? "").trim()
   const storeOpt = opts.routeStore
-  const routeCheck = opts.routeCheck !== false
+  // `routeCheck` 可以是布尔值，也可以是**函数**（惰性取）。
+  // ⚠ 生产必须传函数：宿主先调插件工厂、后登记钩子，工厂期读
+  // `input.magpie.option` 只会拿到「未声明的键 = false」，于是这条判定
+  // 永远走「开关已关闭」分支 —— 真机事故：206 个被改路由的号照样列着
+  // 全部模型，可用号虚高（见 index.mjs 里 `routeCheckNow` 的注释）。
+  const routeCheckOf =
+    typeof opts.routeCheck === "function" ? opts.routeCheck : () => opts.routeCheck !== false
 
   return async function models(provider, ctx = {}) {
     const auth = ctx?.auth
@@ -200,6 +206,8 @@ export function makeModelsHook(opts = {}) {
     // `routecheck` 关掉时，只放过 `routed`（见 opts 注释）；仍在日志里留一句，
     // 否则"我明明关了开关，号还是被换了模型"这件事查起来没有线索。
     const routed = verdict === "routed"
+    // 每次调用都重新问一次开关：钩子这时早已登记，读到的是用户在界面上拨的值。
+    const routeCheck = routeCheckOf() !== false
     const blocking = verdict === "expired" || verdict === "exhausted" || (routed && routeCheck)
     if (routed && !blocking) {
       logOnce(
