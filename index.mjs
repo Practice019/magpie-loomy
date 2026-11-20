@@ -37,7 +37,7 @@
 // 造一个空的 refresh / checkin 是有害的：它会告诉 magpie「这个上游能自动恢复」，
 // 从而把「换号重试」当成有效处置 —— 而现实是只能人工重登。
 
-import { PROVIDER, DEFAULT_BASE_URL } from "./src/constants.mjs"
+import { PROVIDER, DEFAULT_BASE_URL, DEFAULT_BODY_MODE } from "./src/constants.mjs"
 import { makeConfigHook } from "./src/hooks/config.mjs"
 import { makeMethods } from "./src/hooks/methods.mjs"
 import { makeLoaderHook } from "./src/hooks/loader.mjs"
@@ -80,9 +80,68 @@ function resolvePort(options, env, specPort) {
 }
 
 /**
+ * `auth.options`：magpie 供应商编辑页上的开关（T-32 新增）。
+ *
+ * # 形状真源（不许编：全部抄自 `host-acc034d984c6.js` 的 `optionsOf()`，约 2360-2382 行）
+ *
+ *	{ key, label,                          // key `^[a-z0-9_-]{1,40}$`；label 必填 ≤60 字
+ *	  description?,                         // ≤300 字
+ *	  default?,                             // **只认 `=== true`**（即布尔开关）
+ *	  confirm?, labels?, descriptions?, confirms?,   // 多语言覆盖（≤16 项，每项 ≤300）
+ *	  filtersModels?,                       // 打开时模型列表会少几个（编辑器据此加注）
+ *	  placement? }                          // "top" = 画在账号区下方 / Routing 上方
+ *
+ * 破损方式（都**静默**，不报错）：key 不合规 ⇒ 整项跳过；没有 label ⇒ 整项跳过；
+ * `default: "yes"` ⇒ 当 false。**16 个上限**。
+ *
+ * # 为什么只有布尔，没有 select
+ *
+ * `optionsOf()` 把 `default` 归化成 `o.default === true`，宿主**只画 Off/On 开关**。
+ * 所以在界面上放不出「四选一」的下拉；`bodyMode` 只能做成「用非默认形态」的开关，
+ * 具体是哪个形态用 `plugins.json` 的 `bodyMode` 指定（下面有说明）。
+ *
+ * # 两个开关都真接线
+ *
+ *	`bodymode`    → loader 的请求体重写（默认值就是 `DEFAULT_BODY_MODE = "client-body"`；
+ *	                开关**打开** = 用 `plugins.json` 的 `bodyMode` 覆盖，比如 `"default"`）
+ *	`routecheck`  → `provider.models` 里「上游改路由 ⇒ 返回空目录 ⇒ 不派活」这条判定。
+ *	                关掉 = 一个已被上游换掉模型的号仍然会被派活（付 2× 拿降级模型）。
+ *	                `auth.usage` 的说明窗不受影响（它只是**解释**，不做排除）。
+ */
+export const AUTH_OPTIONS = Object.freeze([
+  {
+    key: "bodymode",
+    label: "请求体形态（高级）",
+    description:
+      "关闭 = 用默认 client-body（最稳）。打开 = 改用插件选项 bodyMode 指定的形态（default / client-shape / passthrough）。" +
+      "只有在你确知某个 agent 需要原始 body 时才打开，见 README。",
+    labels: { zh: "请求体形态（高级）", en: "Request body shape (advanced)" },
+    descriptions: {
+      zh: "关闭 = 默认 client-body（最稳）。打开 = 改用插件选项 bodyMode 指定的形态。只有确知需要原始 body 时才打开。",
+      en: "Off: the default client-body (safest). On: whatever the plugin option bodyMode says. Turn on only when you know an agent needs the raw body.",
+    },
+    default: false,
+  },
+  {
+    key: "routecheck",
+    label: "检测上游改路由后停用该号",
+    description:
+      "上游会把整号改成「付 2× 拿 spark」而不报错。打开时插件读到这种账号就把它的模型目录置空，路由不再派活。" +
+      "关闭时仍会在额度卡片上写明原因，但账号会继续被派活。",
+    labels: { zh: "检测上游改路由后停用该号", en: "Disable an account rerouted upstream" },
+    descriptions: {
+      zh: "打开：读到「上游已改路由」的账号就把模型目录置空，路由不再派活。关闭：卡片仍写明原因，但账号继续被派活。",
+      en: "On: an account the vendor rerouted gets an empty model list, so routing skips it. Off: the card still says why, but the account keeps receiving requests.",
+    },
+    default: true,
+    filtersModels: true,
+  },
+])
+
+/**
  * 供应商插件。
  *
- * @param {{client?: any, directory?: string}} [input] magpie 给的宿主输入
+ * @param {{client?: any, directory?: string, magpie?: {option: Function}}} [input] magpie 给的宿主输入
  *   `directory` 就是 magpie 的配置目录（plugin-auth.json 在那里）
  * @param {object} [options] plugins.json 里这一项的 options
  * @returns {Promise<object>} 钩子集合
@@ -97,6 +156,26 @@ export const LoomyAuthPlugin = async (input = {}, options = {}) => {
       }
     : console
 
+  // ── 界面开关（`auth.options`）的读法 ──
+  //
+  // `input.magpie.option(provider, key)` 是 magpie 独有通道（`host.js:2455`），
+  // 读用户在供应商编辑页拨的值。OpenCode 里没有 `input.magpie` ⇒ 回落到 `default`。
+  const option = (key, fallback) => {
+    try {
+      const v = input?.magpie?.option?.(PROVIDER, key)
+      return typeof v === "boolean" ? v : fallback
+    } catch {
+      return fallback
+    }
+  }
+  // `bodymode`：开 = 用 plugins.json 的 bodyMode（如 "default"），关 = 默认形态
+  const bodyModeSwitch = option("bodymode", false)
+  const bodyMode = bodyModeSwitch
+    ? String(options?.bodyMode ?? "").trim() || DEFAULT_BODY_MODE
+    : DEFAULT_BODY_MODE
+  // `routecheck`：关 = 即使上游改了路由也不置空目录（仍会被派活）
+  const routeCheck = option("routecheck", true)
+
   // `configDir` 同时喂给四条钩子：登录态（methods）、请求（loader）、
   // 额度窗口（usage）、模型目录（provider.models）。
   //
@@ -106,12 +185,18 @@ export const LoomyAuthPlugin = async (input = {}, options = {}) => {
   //
   // ⚠ 真正的「排除」只发生在 `provider.models`（routed ⇒ 空目录）；loader 只
   // 记日志、usage 只加说明窗。理由写在 `src/hooks/models.mjs` 顶部。
+  // `routeCheck`（界面开关 `routecheck`）只影响 models 那条排除分支。
   /** @type {any} */
   const auth = {
     provider: PROVIDER,
-    methods: makeMethods({ baseUrl, log, configDir }),
-    loader: makeLoaderHook({ configDir, log, bodyMode: options?.bodyMode }),
+    // `client` 只给第 4 个登录方式用：一次粘多条时，第 2..N 条要走
+    // `client.auth.set` 自己落盘（宿主一次登录只保存一个账号）。
+    methods: makeMethods({ baseUrl, log, configDir, client: input?.client }),
+    loader: makeLoaderHook({ configDir, log, bodyMode }),
     usage: makeUsageHook({ baseUrl, log, configDir }),
+    // 界面开关（真源与破损方式见 `AUTH_OPTIONS` 的注释）。
+    // **必须**挂在 `auth` 上：`optionsOf(a.auth)`，挂顶层等于没写。
+    options: AUTH_OPTIONS.map((o) => ({ ...o })),
     // 从文件批量导入（magpie 自己的钩子，OpenCode 会忽略）。
     // 装上它，供应商编辑页就会出现「从文件导入账号…」按钮。
     ...makeImportHook({
@@ -135,7 +220,8 @@ export const LoomyAuthPlugin = async (input = {}, options = {}) => {
     auth,
     provider: {
       id: PROVIDER,
-      models: makeModelsHook({ baseUrl, log, configDir }),
+      // `routeCheck` 开关：关掉时 models 钩子不再因「上游改路由」返回空目录
+      models: makeModelsHook({ baseUrl, log, configDir, routeCheck }),
     },
   }
 }

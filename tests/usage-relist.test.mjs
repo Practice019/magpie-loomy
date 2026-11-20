@@ -162,7 +162,7 @@ test("变化触发 kept 的同时，窗口仍然按新判定走（routed ⇒ 说
 
   assert.equal(u.signIn, "kept")
   assert.ok(
-    u.windows.some((w) => w.aside === true && String(w.name).includes("整号停用")),
+    u.windows.some((w) => w.aside === true && String(w.name) === "说明 · 上游限制"),
     `新判定必须立刻生效（不能等宿主重读），实际: ${JSON.stringify(u.windows)}`,
   )
 })

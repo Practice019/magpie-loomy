@@ -25,9 +25,9 @@ function okUpstream() {
   }
 }
 
-test("三种登录方式的标签都带中文", () => {
+test("四种登录方式的标签都带中文", () => {
   const m = makeMethods({ fetchImpl: okUpstream() })
-  assert.equal(m.length, 3)
+  assert.equal(m.length, 4)
   for (const x of m) assert.ok(/[\u4e00-\u9fa5]/.test(x.label), `${x.label} 应有中文`)
 })
 

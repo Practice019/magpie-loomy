@@ -29,7 +29,8 @@ import { parseCredential, looksLikeSession, shortUID } from "../credential.mjs"
 import { AccountGateway, looksLikePhone } from "../sms-login.mjs"
 import { firstLogin } from "../points.mjs"
 import { DEFAULT_BASE_URL } from "../constants.mjs"
-import { makeImportHook } from "../importer.mjs"
+import { collectResults } from "../importer.mjs"
+import { makePasteImportMethod } from "../paste-import.mjs"
 
 const has = (o, k) => Object.prototype.hasOwnProperty.call(o ?? {}, k)
 
@@ -108,7 +109,9 @@ function successResult(cred) {
 /**
  * 构建 `auth.methods`。
  *
- * @param {{baseUrl?: string, clientStoreDir?: string, fetchImpl?: typeof fetch, log?: object}} opts
+ * @param {{baseUrl?: string, clientStoreDir?: string, fetchImpl?: typeof fetch, log?: object,
+ *   configDir?: string, client?: any}} opts
+ *   `client`：宿主的 `client.auth.set` 通道（批量导入时第 2..N 条账号靠它落盘）。
  * @returns {object[]}
  */
 export function makeMethods(opts = {}) {
@@ -304,7 +307,17 @@ export function makeMethods(opts = {}) {
     },
   }
 
-  return [localMethod, smsMethod, pasteMethod]
+  // ④ 从文件导入（粘贴 JSON / NDJSON）—— 用户要求：导入入口必须在**登录弹窗**里，
+  // 因为供应商详情页把 301 个账号全列出来，导入按钮被挤到最底下。
+  // 复用 `src/importer.mjs` 的解析/去重（不写第二套解析器）。
+  const importMethod = makePasteImportMethod({
+    configDir,
+    client: opts.client,
+    log,
+    collect: (texts) => collectResults(texts, { configDir, reportBadLines: true }),
+  })
+
+  return [localMethod, smsMethod, pasteMethod, importMethod]
 }
 
 /**

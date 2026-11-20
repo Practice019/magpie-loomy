@@ -73,7 +73,7 @@
     </section>
     <section class="pane" id="pane-settings" role="tabpanel" aria-labelledby="tab-settings" hidden>
       <div class="card">
-        <div class="section-heading"><div><h2>设置</h2><p>批量检测的并发与省积分开关，改动即保存。</p></div><span class="section-tag">SETTINGS</span></div>
+        <div class="section-heading"><div><h2>设置</h2><p>批量检测的并发与省积分开关，改动即保存。自动重读默认关闭（只读本地缓存、不碰上游）。</p></div><span class="section-tag">SETTINGS</span></div>
         <div class="toolbar">
           <label class="field">批量检测并发 <input id="setting-batch-concurrency" type="number" min="1" step="1" value="2"></label>
           <label class="field">余额刷新并发 <input id="setting-balance-concurrency" type="number" min="1" step="1" value="2"></label>
@@ -84,6 +84,8 @@
           <label class="field"><input id="setting-batch-skip" type="checkbox" checked> 跳过已有结论的账号</label><label class="field"><input id="setting-auto-apply" type="checkbox" checked> 自动应用判定</label><label class="field">magpie 路径 <input id="setting-magpie-path" type="text" placeholder="留空 = 自动探测"></label>
           <label class="field">账号列表类并发 <input id="setting-account-concurrency" type="number" min="1" step="1" value="20"></label>
           <label class="field">账本采样次数 <input id="setting-ledger-reads" type="number" min="1" max="5" step="1" value="3"></label>
+          <label class="check"><input type="checkbox" id="setting-focus-refresh"> 切回窗口时重读缓存</label>
+          <small>只读本地缓存文件，不发任何上游请求；默认关闭。</small>
           <span id="settings-status" class="muted" role="status"></span>
         </div>
         <p class="hint">并发：同时跑几个；设太大容易被上游限流，出问题会自动熔断（相邻调用仍限制在 300ms 一次）。跳过已有结论：已检测出「正常 / 已被限制」的号不再重复调用，省积分。账本采样次数：每号读几次账本取最新，越大越准越慢。</p>

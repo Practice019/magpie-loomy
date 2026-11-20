@@ -485,7 +485,8 @@ test("日志只在第三页聚合，包含时间来源，可复制和清空", as
   const text = f.get("#operation-log").textContent
   assert.match(text, /\[[^\]\n]+\] \[账号\] 开始补齐任务/)
   assert.match(text, /\[[^\]\n]+\] \[绑定\] 开始绑定/)
-  assert.match(text, /\[账号\] 已读取本地缓存/)
+  // 首屏日志措辞已统一（T-35）：说清「只读了本地缓存、没发上游」（原来是「已读取本地缓存」）
+  assert.match(text, /\[面板\] 首屏已载入本地缓存（未触发任何上游请求）/)
   await f.get("#logs-copy").click()
   assert.deepEqual(copied, [text])
   await f.get("#logs-clear").click()

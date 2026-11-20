@@ -65,8 +65,11 @@ const CATALOG_TIMEOUT_MS = 15_000
  * 构建 `provider.models` 钩子。
  *
  * @param {{baseUrl?: string, fetchImpl?: typeof fetch, log?: {warn: Function},
- *   configDir?: string, routeStore?: any}} [opts]
+ *   configDir?: string, routeStore?: any, routeCheck?: boolean}} [opts]
  *   `configDir` / `routeStore`：读「这个账号是不是被上游限制了」。
+ *   `routeCheck`：界面开关 `routecheck`（默认 **开**）。关掉 = `routed` 不再置空目录，
+ *   账号会继续被派活（付 2× 拿降级模型）。`expired` / `exhausted` **不受影响**——
+ *   那两个不是"上游把号换掉了"，是"这个号自己坏了"，继续派活只会白刷 401/402。
  * @returns {(provider: any, ctx?: {auth?: any}) => Promise<Record<string, object>>}
  */
 export function makeModelsHook(opts = {}) {
@@ -75,6 +78,7 @@ export function makeModelsHook(opts = {}) {
   const log = opts.log ?? console
   const configDir = String(opts.configDir ?? "").trim()
   const storeOpt = opts.routeStore
+  const routeCheck = opts.routeCheck !== false
 
   return async function models(provider, ctx = {}) {
     const auth = ctx?.auth
@@ -93,7 +97,21 @@ export function makeModelsHook(opts = {}) {
     // deepseek 全部落到 spark-x2.6-low），只删一个模型等于让别的模型继续被换掉。
     const hit = await lookupRoute(auth, { configDir, routeStore: storeOpt })
     const verdict = hit?.entry?.verdict
-    if (verdict === "routed" || verdict === "expired" || verdict === "exhausted") {
+    // `routecheck` 关掉时，只放过 `routed`（见 opts 注释）；仍在日志里留一句，
+    // 否则"我明明关了开关，号还是被换了模型"这件事查起来没有线索。
+    const routed = verdict === "routed"
+    const blocking = verdict === "expired" || verdict === "exhausted" || (routed && routeCheck)
+    if (routed && !blocking) {
+      try {
+        log.warn?.(
+          `loomy: 账号 ${hit.key} 已被上游限制（全部模型实际由 ${String(hit.entry?.servedModel ?? "").trim() || "上游其它模型"} 服务），` +
+            `但界面开关 routecheck 已关闭 —— 目录照常列出，路由仍会派活`,
+        )
+      } catch {
+        /* 日志失败不是业务失败 */
+      }
+    }
+    if (blocking) {
       try {
         log.warn?.(
           verdict === "expired"

@@ -12,7 +12,7 @@
 // 缓存只在网关请求失败时当兜底 —— 并且**如实标注它可能过期**。
 
 import { fetchPointsSnapshot, fetchTasks } from "../points.mjs"
-import { usageFromPoints, tasksSummary } from "../usage.mjs"
+import { usageFromPoints, tasksSummary, QUOTA_PREFIX, STOP_PREFIX, NOTE_PREFIX } from "../usage.mjs"
 import { readLocalPoints, defaultClientStoreDir } from "../client-store.mjs"
 import { accountKeys, accountRoute, cooldownOf } from "./loader.mjs"
 
@@ -146,9 +146,9 @@ export function makeUsageHook(opts) {
    *
    * # 两种结论，两种表达
    *
-   *	routed   → 说明窗「上游限制 · 整号停用」；**不带** `signIn`
+   *	routed   → 说明窗「说明 · 上游限制」；**不带** `signIn`
    *	           （改路由不是登录问题，带 `signIn` 会把号误标成过期）
-   *	expired  → 说明窗「登录失效 · 已停用」+ 顶层 `signIn: "expired"`
+   *	expired  → 说明窗「说明 · 登录失效」+ 顶层 `signIn: "expired"`
    *
    * # ⚠ 三条不要碰的东西
    *
@@ -198,16 +198,16 @@ export function makeUsageHook(opts) {
   }
 
   /**
-   * 「积分不足」的**满额窗口** —— 可计入路由的那一条。
+   * 「停用 · 积分不足」的**满额窗口** —— 可计入路由的那一条。
    *
-   * ⚠ 它和下面那些 `aside` 说明窗是两个东西：
+   * ⚠ 它和那些 `aside` 说明窗是两个东西：
    *   · `aside` 会被 `allowanceOf` 整条跳过（只用来给用户看原因）
    *   · 这条没有 aside、没有 amount/limit，`used:100` ⇒ 路由认为满额 ⇒ 跳过该号
    *
    * @returns {{name: string, used: number, display: string}}
    */
   function exhaustedWindow() {
-    return { name: "积分不足", used: 100, display: "0 积分（充值后自动恢复）" }
+    return { name: `${STOP_PREFIX}积分耗尽`, used: 100, display: "0 积分（充值后自动恢复）" }
   }
 
   /**
@@ -215,9 +215,9 @@ export function makeUsageHook(opts) {
    *
    * # 三类结论，三种处置
    *
-   *	routed     aside 说明窗「上游限制 · 整号停用」；**不带** `signIn`
-   *	expired    aside 说明窗「登录失效 · 已停用」+ 顶层 `signIn: "expired"`
-   *	exhausted  aside 说明窗「积分不足 · 已停用」+ 满额窗口；**不带** `signIn`
+   *	routed     aside 说明窗「说明 · 上游限制」；**不带** `signIn`
+   *	expired    aside 说明窗「说明 · 登录失效」+ 顶层 `signIn: "expired"`
+   *	exhausted  aside 说明窗「说明 · 余额为零」+ 停用窗「停用 · 积分不足」；**不带** `signIn`
    *
    * 另外**不论判定如何**，只要账本显示余额 <= 0 就补那条满额窗口（真实请求
    * 会 402，拦它的唯一手段就是让路由看到满额）。两条触发条件合并成一条窗口，
@@ -255,7 +255,7 @@ export function makeUsageHook(opts) {
       } catch {
         /* 日志失败不是业务失败 */
       }
-      notes.push({ name: "登录失效 · 已停用", aside: true, display: "session 已过期，请重新登录" })
+      notes.push({ name: `${NOTE_PREFIX}登录失效`, aside: true, display: "session 已过期，请重新登录" })
     } else if (verdict === "routed") {
       const served = String(hit?.entry?.servedModel ?? "").trim() || "上游其它模型"
       try {
@@ -263,7 +263,10 @@ export function makeUsageHook(opts) {
       } catch {
         /* 日志失败不是业务失败 */
       }
-      notes.push({ name: "上游限制 · 整号停用", aside: true, display: `全部模型实际由 ${served} 服务` })
+      // ⚠ 名字里**禁止**带易变数据（T-37）：上游换服务的模型名每次都可能变，
+      //   拼进 name 会让窗口「改名抖动」。名字固定为 `说明 · 上游限制`，
+      //   模型名只进 `display`。
+      notes.push({ name: `${NOTE_PREFIX}上游限制`, aside: true, display: `全部模型实际由 ${served} 服务` })
       // ── **立刻停派**：可计入路由的满额窗 ──
       //
       // 真机痛点：`provider.models` 是列表缓存 —— 判定翻成 routed 之后要等下一次
@@ -272,9 +275,10 @@ export function makeUsageHook(opts) {
       //
       // ⚠ 不是 aside（aside 会被 allowanceOf 整条跳过）；也不要 amount/limit
       //   （那会被反算成百分比）。说明窗照旧保留，用于卡片上解释原因。
-      head.push({ name: "上游改路由 · 已停用", used: 100, display: `实际由 ${served} 服务` })
+      // ⚠ 这条是 loomy **唯一**让路由跳过该号的手段 —— 绝不能被改成 aside。
+      head.push({ name: `${STOP_PREFIX}上游改路由`, used: 100, display: `实际由 ${served} 服务；换回后自动恢复` })
     } else if (isExhausted) {
-      notes.push({ name: "积分不足 · 已停用", aside: true, display: "团队积分余额不足，充值后自动恢复" })
+      notes.push({ name: `${NOTE_PREFIX}余额为零`, aside: true, display: "团队积分余额不足，充值后自动恢复" })
     }
 
     // 满额窗口：余额为 0 **或** 判定为 exhausted（两者合并，只出一条）
@@ -301,7 +305,7 @@ export function makeUsageHook(opts) {
     if (cooling) {
       const seconds = Math.max(1, Math.round((cooling.until - now()) / 1000))
       head.push({
-        name: "限流冷却",
+        name: `${STOP_PREFIX}限流冷却`,
         used: 100,
         display: `上游限流，约 ${seconds} 秒后恢复`,
         resetsAt: new Date(cooling.until).toISOString(),

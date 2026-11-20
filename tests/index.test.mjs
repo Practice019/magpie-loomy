@@ -46,13 +46,14 @@ test("刻意不导出 refresh / checkin（造空壳会让宿主误判可自动�
   assert.equal(p.auth.checkin, undefined)
 })
 
-test("三种登录方式都在", async () => {
+test("四种登录方式都在（第 4 个是登录弹窗里的「从文件导入」）", async () => {
   const p = await LoomyAuthPlugin({}, {})
-  assert.equal(p.auth.methods.length, 3)
+  assert.equal(p.auth.methods.length, 4)
   const labels = p.auth.methods.map((m) => m.label)
   assert.ok(labels.some((l) => l.includes("桌面端")))
   assert.ok(labels.some((l) => l.includes("手机号")))
   assert.ok(labels.some((l) => l.includes("粘贴")))
+  assert.ok(labels.some((l) => l.includes("从文件导入")))
 })
 
 test("_internal 不导出额外的 Plugin 函数（会被当成插件调用）", () => {

@@ -30,6 +30,8 @@ const EXPECTED_SETTINGS = Object.freeze({
   magpiePath: "",
   batchSkipChecked: true,
   ledgerReads: 3,
+  // T-35：切回窗口自动重读，**默认关**（用户要求「禁止自动刷新」）
+  focusRefresh: false,
 })
 
 /** 只有 legacy 两项变了（并发两键的合并测试里用）。 */
@@ -328,6 +330,9 @@ test("设置拒绝非法值、额外字段及非法 JSON，写入失败不改变
     { gapMs: 1.5 },
     { autoApply: "true" },
     { magpiePath: 123 },
+    // T-35：新开关只收布尔值
+    { focusRefresh: "true" },
+    { focusRefresh: 1 },
   ]) {
     assert.equal((await f.raw("POST", "/api/settings", body)).status, 400, JSON.stringify(body))
     assert.deepEqual((await f.api("/api/settings")).settings, EXPECTED_SETTINGS, `${JSON.stringify(body)} 不得写盘`)
@@ -338,6 +343,10 @@ test("设置拒绝非法值、额外字段及非法 JSON，写入失败不改变
   assert.equal((await f.raw("POST", "/api/settings", { gapMs: 5000 })).status, 200)
   assert.equal((await f.api("/api/settings")).settings.gapMs, 5000)
   assert.equal((await f.raw("POST", "/api/settings", { gapMs: 300 })).status, 200)
+  // T-35：focusRefresh 落盘后可读回（默认 false，显式 true 也要能存）
+  assert.equal((await f.raw("POST", "/api/settings", { focusRefresh: true })).status, 200)
+  assert.equal((await f.api("/api/settings")).settings.focusRefresh, true)
+  assert.equal((await f.raw("POST", "/api/settings", { focusRefresh: false })).status, 200)
 
   assert.deepEqual((await f.api("/api/settings")).settings, EXPECTED_SETTINGS)
   mkdirSync(join(f.dir, "loomy-panel-state.json"))

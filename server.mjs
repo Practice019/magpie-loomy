@@ -1958,6 +1958,9 @@ export const PANEL_SETTINGS_DEFAULTS = Object.freeze({
   magpiePath: "",
   batchSkipChecked: true,
   ledgerReads: 3,
+  // 切回窗口时是否重读本地缓存。**默认关**：用户原话「禁止自动刷新，因为发请求都有风险」——
+  // 即使那 5 个 GET 只读本地缓存、绝不触发上游，开关也必须由用户自己决定。
+  focusRefresh: false,
 })
 
 const SETTINGS_FILE = "loomy-panel-settings.json"
@@ -2033,6 +2036,7 @@ function validPanelSetting(key, value) {
   if (CONCURRENCY_KEY_LIST.includes(key)) return Number.isInteger(value) && value >= 1
   if (key === "batchSkipChecked") return typeof value === "boolean"
   if (key === "ledgerReads") return Number.isInteger(value) && value >= 1 && value <= 5
+  if (key === "focusRefresh") return typeof value === "boolean"
   return false
 }
 
@@ -2132,6 +2136,7 @@ async function savePanelSettings(req, res, ctx) {
   "ledgerReads",
   "autoApply",
   "magpiePath",
+  "focusRefresh",
 ]
   if (!isPlainObject(input) || !Object.keys(input).length) {
     return sendJson(res, 400, { error: `仅接受 ${accepted.join("/")}，值必须合法` })
@@ -2148,7 +2153,7 @@ async function savePanelSettings(req, res, ctx) {
       continue
     }
     if (!validPanelSetting(key, value)) {
-      return sendJson(res, 400, { error: key === "batchConcurrency" || key === "balanceConcurrency" ? `${key} 必须是 ≥1 的整数` : key === "ledgerReads" ? "ledgerReads 必须是 1..5 的整数" : "batchSkipChecked 必须是布尔值" })
+      return sendJson(res, 400, { error: key === "batchConcurrency" || key === "balanceConcurrency" ? `${key} 必须是 ≥1 的整数` : key === "ledgerReads" ? "ledgerReads 必须是 1..5 的整数" : key === "focusRefresh" ? "focusRefresh 必须是布尔值" : "batchSkipChecked 必须是布尔值" })
     }
     panel[key] = value
   }

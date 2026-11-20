@@ -3,7 +3,10 @@ const $$ = (s) => Array.from(document.querySelectorAll(s))
 const BASE = new URL(document.currentScript.src).origin
 const state = { accounts: [], tasks: new Map(), invites: new Map(), route: new Map(), selected: new Set(), busy: false, accountPage: 1, invitePage: 1, accountSize: 50, inviteSize: 50,
   // 面板设置（服务端权威值；`batchSkipChecked` 决定批量是否跳号）
-  panel: { batchConcurrency: 2, balanceConcurrency: 2, batchSkipChecked: true, ledgerReads: 3 },
+  // ⚠ `focusRefresh` 本地初值必须是 false：服务端没读到之前，切窗口一律不重读。
+  panel: { batchConcurrency: 2, balanceConcurrency: 2, batchSkipChecked: true, ledgerReads: 3, focusRefresh: false },
+  // 上次已经打过「服务启动于 …」的那个 `since`（同一个进程只打一次，重启才再打）
+  serviceLoggedSince: 0,
   // 一次批量检测的状态机：idle → running → (finished | stopped)
   batch: { jobId: "", running: false, finished: false, total: 0, done: 0, okCount: 0, failCount: 0, skipped: new Set(), failed: [], stopped: "" },
   // 三个刷新任务（余额 / 任务 / 邀请）：共用服务端并发槽
@@ -167,7 +170,11 @@ function clock(at) {
 function quota(a) {
   if (a.cached !== true || !a.quota) return '<span class="muted" title="还没查询过；点「刷新全部」获取余额">未查询</span>'
   const windows = a.quota?.windows ?? []
-  const amount = (prefix) => windows.find((w) => String(w.name).startsWith(prefix))?.amount
+  // ⚠ 窗口名带类型前缀（T-31：`额度 · 每日赠送` / `说明 · 永久积分` / `说明 · 可用总额`），
+  //   但**旧缓存**里的名字没有前缀。所以比对前先剥掉前缀 —— 否则升级后的第一次渲染
+  //   会读到 undefined，整列显示成「—」。
+  const bare = (w) => String(w?.name ?? "").replace(/^(额度|停用|说明) · /, "")
+  const amount = (needle) => windows.find((w) => bare(w).startsWith(needle))?.amount
   const detail = `每日 ${num(amount("每日赠送"))} · 永久 ${num(amount("永久积分"))}`
   const at = a.at ? `截至 ${clock(a.at)}` : ""
   const title = [detail, at, a.error ? a.error : ""].filter(Boolean).join("；")
@@ -852,6 +859,8 @@ async function loadSettings() {
       balanceConcurrency: Number(settings.balanceConcurrency) || 2,
       batchSkipChecked: settings.batchSkipChecked !== false,
       ledgerReads: Number(settings.ledgerReads) || 3,
+      // 严格 `=== true`：字段缺失 / 旧服务端 → 关（宁可不动，也不偷偷重读）
+      focusRefresh: settings.focusRefresh === true,
     }
     for (const [key, selector] of Object.entries(concurrencyFields)) {
       const value = settings[key] === undefined ? 20 : settings[key]
@@ -1098,6 +1107,8 @@ function syncSettingsFields() {
   setValue("#setting-ledger-reads", state.panel.ledgerReads)
   const skip = $("#setting-batch-skip")
   if (skip) skip.checked = state.panel.batchSkipChecked !== false
+  const focusRefresh = $("#setting-focus-refresh")
+  if (focusRefresh) focusRefresh.checked = state.panel.focusRefresh === true
 }
 
 async function saveSetting(patch) {
@@ -1112,6 +1123,7 @@ async function saveSetting(patch) {
         balanceConcurrency: Number(settings.balanceConcurrency) || state.panel.balanceConcurrency,
         batchSkipChecked: settings.batchSkipChecked !== false,
         ledgerReads: Number(settings.ledgerReads) || state.panel.ledgerReads,
+        focusRefresh: settings.focusRefresh === true,
       }
     }
     if (status) status.textContent = "已保存"
@@ -1145,6 +1157,7 @@ numberSetting("#setting-patrol-concurrency", 1, undefined, "patrolConcurrency")
 numberSetting("#setting-gap-ms", 0, 5000, "gapMs")
 numberSetting("#setting-ledger-reads", 1, 5, "ledgerReads")
 $("#setting-batch-skip")?.addEventListener("change", (e) => { void saveSetting({ batchSkipChecked: e.target.checked === true }) })
+$("#setting-focus-refresh")?.addEventListener("change", (e) => { void saveSetting({ focusRefresh: e.target.checked === true }) })
 $("#setting-auto-apply")?.addEventListener("change", (e) => { void saveSetting({ autoApply: e.target.checked === true }) })
 $("#setting-magpie-path")?.addEventListener("change", (e) => { void saveSetting({ magpiePath: String(e.target.value ?? "").trim() }) })
 // 「只看被限制」：纯前端筛选，不发请求
@@ -1164,7 +1177,7 @@ async function loadInitial() {
     await balances()
     render()
     await queries([tasks(), invites(), routeStates()])
-    log("账号", "已读取本地缓存；需要新数据请点「刷新全部（余额·任务·邀请）」")
+    log("面板", "首屏已载入本地缓存（未触发任何上游请求）")
   }, "账号")
 }
 
@@ -1191,7 +1204,12 @@ async function renderServiceClock() {
     el.title = `服务启动 ${full(since)}（已运行 ${age}，PID ${hello.pid ?? "?"}）`
     el.dataset.serviceSince = String(since)
     el.dataset.serviceLabel = `启动 ${hhmm(since)}`
-    log("面板", `服务启动于 ${full(since)}，已运行 ${age}`)
+    // 只有 `since` 变了（服务真的重启）才再打一行：这个函数会被反复调用，
+    // 每调一次打一行等于把日志刷成噪音，用户根本看不到别的记录。
+    if (state.serviceLoggedSince !== since) {
+      log("面板", `服务启动于 ${full(since)}，已运行 ${age}`)
+      state.serviceLoggedSince = since
+    }
   } catch (e) {
     log("面板", `服务启动时间未知：${e.message}`)
   }
@@ -1201,10 +1219,18 @@ async function renderServiceClock() {
  * 窗口重新获得焦点时（`visibilitychange` / `focus`）：重读**5 个缓存型 GET**。
  *
  * 目的：别人（或 API / 别的窗口）改了状态文件后，用户切回来数字就对了。
- * 三条硬约束：
- *   ① 只打 `/api/accounts|settings|tasks|invite|route-state`，**绝不触发上游**；
+ * 四条硬约束：
+ *   ⓪ **默认关闭**：`state.panel.focusRefresh` 不为 true 就在第一行早退。
+ *      用户原话「禁止自动刷新，因为发请求都有风险」—— 这一步由用户自己决定；
+ *      两个事件监听照样注册，所以打开开关**运行时立即生效**。
+ *   ① 只打 `/api/accounts|settings|tasks|invite|route-state`，**绝不触发上游**
+ *      （这五个 GET 在 server.mjs 顶部有注释：只读本地缓存文件）；
  *   ② 两次自动重读间隔 ≥ `FOCUS_REFRESH_MS`（5 秒），切来切去不会抖；
  *   ③ 批量/刷新任务正在跑时不插队（那会打乱进度轮询的节奏）。
+ *
+ * ⚠ 缓存里的 `error` 是**上次真实查询**留下的原文（`/api/invite` 从
+ * `invite-cache.json` 原样带回），不是本次请求的失败 —— 所以这里不再沿用
+ * 「自动重读失败：邀请码查询部分失败」那种措辞，只把条数说清楚。
  *
  * @returns {Promise<boolean>} 这次是否真的重读了
  */
@@ -1212,7 +1238,16 @@ const FOCUS_REFRESH_MS = 5000
 let lastFocusRefreshAt = 0
 let focusRefreshInFlight = false
 
+/** 缓存里「上次真实查询失败」的账号条数（invites + tasks，按 uid 去重）。 */
+function cachedFailures() {
+  const uids = new Set()
+  for (const row of state.invites.values()) if (row?.error) uids.add(row.uid)
+  for (const row of state.tasks.values()) if (row?.error) uids.add(row.uid)
+  return uids.size
+}
+
 async function refreshOnFocus() {
+  if (!state.panel?.focusRefresh) return false
   const now = Date.now()
   if (focusRefreshInFlight) return false
   if (now - lastFocusRefreshAt < FOCUS_REFRESH_MS) return false
@@ -1221,14 +1256,21 @@ async function refreshOnFocus() {
   lastFocusRefreshAt = now
   try {
     await balances()
-    await queries([tasks(), invites(), routeStates()])
+    // `queries` 会把「某行 error」当成整体失败 —— 那是缓存里的旧错误，
+    // 这里用 allSettled 收住，先渲染出数据，再单独统计条数。
+    await Promise.allSettled([tasks(), invites(), routeStates()])
+    // `render()` 里会按需重读一次设置（同一份本地缓存）——直接把那个「警告文案」
+    // 接在同一个 promise 上，不要在没有 catch 的调用后面 `await` 一个新 promise。
+    const settingsReady = render()
     const warning = await loadSettings()
+    await settingsReady
     if (warning) log("面板", warning)
-    render()
     log("面板", "窗口回到前台，已重读本地缓存（未触发任何上游请求）")
+    const failures = cachedFailures()
+    if (failures > 0) log("面板", `缓存里有 ${failures} 个账号的上次查询失败（不是本次请求）`)
     return true
   } catch (e) {
-    log("面板", `自动重读失败：${e.message}`)
+    log("面板", `重读本地缓存失败：${e.message}（未触发任何上游请求）`)
     return false
   } finally {
     focusRefreshInFlight = false

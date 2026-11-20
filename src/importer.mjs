@@ -59,26 +59,30 @@ export const IMPORT_FROMS = {
  * 按顺序尝试四种形态，**取第一个能解析出东西的**（不合并，避免同一份
  * 数据被解析两次）。
  *
+ * `badLines` 是 NDJSON 里**解析不了的行**（1 起的行号 + 原因）。文件导入
+ * 钩子不看它（坏行就是少一条）；登录弹窗的导入按钮用它逐行报错
+ * （「第 N 条：这一行不是合法的 JSON」）。
+ *
  * @param {string} text
- * @returns {{ items: any[], shapes: string }}
+ * @returns {{ items: any[], shapes: string, badLines: Array<{index: number, error: string}> }}
  */
 export function extractItems(text) {
   const raw = String(text ?? "").trim()
-  if (!raw) return { items: [], shapes: "empty" }
+  if (!raw) return { items: [], shapes: "empty", badLines: [] }
 
   // ① 整段是合法 JSON（数组或单个对象）
   try {
     const v = JSON.parse(raw)
-    if (Array.isArray(v)) return { items: v, shapes: "json-array" }
+    if (Array.isArray(v)) return { items: v, shapes: "json-array", badLines: [] }
     if (v && typeof v === "object") {
       // 有些导出会包一层：{"accounts":[...]} / {"data":[...]} / {"list":[...]}
       for (const key of ["accounts", "data", "list", "items"]) {
-        if (Array.isArray(v[key])) return { items: v[key], shapes: `json-object.${key}` }
+        if (Array.isArray(v[key])) return { items: v[key], shapes: `json-object.${key}`, badLines: [] }
       }
-      return { items: [v], shapes: "json-object" }
+      return { items: [v], shapes: "json-object", badLines: [] }
     }
     // 裸字符串：它自己可能就是 session
-    if (typeof v === "string") return { items: [{ session: v }], shapes: "json-string" }
+    if (typeof v === "string") return { items: [{ session: v }], shapes: "json-string", badLines: [] }
   } catch {
     // 不是整段 JSON，往下试
   }
@@ -86,30 +90,33 @@ export function extractItems(text) {
   // ② 每行一个 JSON（NDJSON）
   const lines = raw.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)
   const perLine = []
+  /** @type {Array<{index: number, error: string}>} 解析不了的行（1 起的行号） */
+  const badLines = []
   let parsedAny = false
-  for (const line of lines) {
+  for (const [index, line] of lines.entries()) {
     try {
       const v = JSON.parse(line)
       if (Array.isArray(v)) perLine.push(...v)
       else perLine.push(v)
       parsedAny = true
     } catch {
-      // 这一行不是 JSON：可能是裸 session，兜到 ③ 一起处理
+      // 这一行不是 JSON：可能是裸 session（兜到 ③），也可能是真坏行（记下来）
+      badLines.push({ index: index + 1, error: "这一行不是合法的 JSON" })
     }
   }
-  if (parsedAny) return { items: perLine, shapes: "ndjson" }
+  if (parsedAny) return { items: perLine, shapes: "ndjson", badLines }
 
   // ③ 整段就是一串 session（每行一个 32 位 hex）
   const bare = lines.filter((l) => looksLikeSession(l))
-  if (bare.length > 0) return { items: bare.map((session) => ({ session })), shapes: "bare-sessions" }
+  if (bare.length > 0) return { items: bare.map((session) => ({ session })), shapes: "bare-sessions", badLines: [] }
 
   // ④ 文本里散落着 session（从截图/日志里抠出来的情形）
   const found = raw.match(/\b[0-9a-f]{32}\b/g) ?? []
   if (found.length > 0) {
-    return { items: [...new Set(found)].map((session) => ({ session })), shapes: "scattered-sessions" }
+    return { items: [...new Set(found)].map((session) => ({ session })), shapes: "scattered-sessions", badLines: [] }
   }
 
-  return { items: [], shapes: "unrecognised" }
+  return { items: [], shapes: "unrecognised", badLines: [] }
 }
 
 /**
@@ -198,29 +205,34 @@ export const IMPORT_PROBE_BREAKER = 3
  * 别的 provider 的账号不该影响我们的去重。
  *
  * @param {string} configDir
- * @returns {{uids: Set<string>, sessions: Set<string>}}
+ * @returns {{uids: Set<string>, sessions: Set<string>, keys: Set<string>}}
+ *   `keys` 是已被占用的账号键（`loomy` / `loomy#…`）—— 登录弹窗的批量导入要
+ *   自己分配新键（host 的 `freshKey` 只用一次，多出来的号得插件自己找位置）。
  */
 export function readExistingAccounts(configDir) {
   /** @type {Set<string>} */
   const uids = new Set()
   /** @type {Set<string>} */
   const sessions = new Set()
+  /** @type {Set<string>} */
+  const keys = new Set()
 
   const dir = String(configDir ?? "").trim()
-  if (!dir) return { uids, sessions }
+  if (!dir) return { uids, sessions, keys }
   const file = join(dir, "plugin-auth.json")
-  if (!existsSync(file)) return { uids, sessions }
+  if (!existsSync(file)) return { uids, sessions, keys }
 
   /** @type {any} */
   let all
   try {
     all = JSON.parse(readFileSync(file, "utf8"))
   } catch {
-    return { uids, sessions }
+    return { uids, sessions, keys }
   }
 
   for (const [key, value] of Object.entries(all ?? {})) {
     if (key !== PROVIDER && !key.startsWith(PROVIDER + "#")) continue
+    keys.add(key)
     const v = /** @type {any} */ (value)
     // 两种形态都认：oauth 的 access，以及早期写法的 api/key
     const session = String(v?.access ?? v?.key ?? "").trim()
@@ -228,7 +240,7 @@ export function readExistingAccounts(configDir) {
     const uid = String(v?.metadata?.uid ?? v?.uid ?? "").trim()
     if (uid) uids.add(uid)
   }
-  return { uids, sessions }
+  return { uids, sessions, keys }
 }
 
 /**
@@ -324,6 +336,104 @@ function isBreakerFailure(e) {
 }
 
 /**
+ * 把一段文本（或几段）变成「登录结果」列表。
+ *
+ * `auth.import`（文件导入）与登录弹窗里的「从文件导入（粘贴）」**共用这一条**
+ * 解析/去重/截断逻辑 —— 不许出现第二套解析器（两份实现迟早对不上）。
+ *
+ * @param {string[]} texts 每段文本（一个文件一段，或用户粘贴的一大段）
+ * @param {{configDir?: string, verify?: (session: string) => Promise<void>,
+ *   signal?: AbortSignal, reportBadLines?: boolean}} [opts]
+ *   `reportBadLines`：把 NDJSON 里解析不了的行也报成 `{type:"failed"}`，错误原文
+ *   形如「第 2 条：这一行不是合法的 JSON」。文件导入不传（坏行=少一条）；
+ *   登录弹窗传 true（用户要看见是哪一行坏了）。
+ * @returns {Promise<{results: object[], accepted: object[], duplicates: number, badLines: number}>}
+ */
+export async function collectResults(texts, opts = {}) {
+  const list = Array.isArray(texts) ? texts.filter((t) => typeof t === "string" && t.trim()) : []
+  if (list.length === 0) return { results: [], accepted: [], duplicates: 0, badLines: 0 }
+
+  const signal = opts.signal
+
+  // ── ① 先把所有文件摊平（一次最多 IMPORT_MOST，但**计数要真实**）──
+  //
+  // ⚠ 旧实现在循环里直接 `slice(0, 100)`，被切掉的部分不报错、不提示 ——
+  // 用户导 117 条，17 条永远进不来（再导一次还是切前 100 条）。
+  // 现在改成：摊平 → 去重 → 截断时**追加一条 failed 说明**。
+  /** @type {string[]} */
+  const items = []
+  /** @type {string[]} */
+  const bad = []
+  for (const text of list) {
+    if (signal?.aborted) break
+    const parsed = extractItems(text)
+    if (opts.reportBadLines) {
+      for (const b of parsed.badLines ?? []) bad.push(`第 ${b.index} 条：${b.error}`)
+    }
+    for (const item of parsed.items) items.push(item)
+  }
+
+  // ── ② 去重：已经在 magpie 里的账号不要再返回 ──
+  //
+  // 这是「分两次导完」的前提：用户第二次选同一个文件时，前 100 个会被跳过。
+  // 判据是 uid **或** session —— 同一个号可能以不同 uid 形态出现
+  // （`userid` / 派生的 uid），但 session 只有一个。
+  const existing = readExistingAccounts(opts.configDir)
+  const seenUid = new Set(existing.uids)
+  const seenSession = new Set(existing.sessions)
+
+  /** @type {object[]} */
+  const fresh = []
+  let duplicates = 0
+  for (const item of items) {
+    if (signal?.aborted) break
+    const result = await toSignInResult(item, { verify: opts.verify })
+    if (result.type === "success") {
+      const session = String(result.access ?? "")
+      const uid = String(result.uid ?? "")
+      if ((session && seenSession.has(session)) || (uid && seenUid.has(uid))) {
+        duplicates += 1
+        continue
+      }
+      if (session) seenSession.add(session)
+      if (uid) seenUid.add(uid)
+    }
+    fresh.push(result)
+  }
+
+  /** @type {object[]} */
+  const results = bad.map((error) => ({ type: "failed", error }))
+
+  // 一条都没解析出来：给一条 failed 说明原因，而不是静默返回空数组。
+  // 静默的空结果在界面上表现为「点了导入，什么都没发生」。
+  if (items.length === 0 && fresh.length === 0) {
+    results.push({ type: "failed", error: `没从文件里认出账号（要含 session 字段的 JSON；provider=${PROVIDER}）` })
+    return { results, accepted: [], duplicates, badLines: bad.length }
+  }
+  // 全都在池子里了：如实说「没有新账号」，而不是返回空数组让人以为坏了。
+  if (fresh.length === 0) {
+    results.push({ type: "failed", error: `这 ${duplicates} 个账号都已经在 magpie 里了，没有新的要导入` })
+    return { results, accepted: [], duplicates, badLines: bad.length }
+  }
+
+  // ── ③ 截断必须**说清**（magpie 单次只收 IMPORT_MOST 条）──
+  const accepted = fresh.slice(0, IMPORT_MOST)
+  const leftover = fresh.length - accepted.length
+  results.push(...accepted)
+  if (leftover > 0) {
+    results.push({
+      type: "failed",
+      error:
+        `本文件共 ${fresh.length} 条，已导入 ${accepted.length} 条；` +
+        `还有 ${leftover} 条超出 magpie 单次 ${IMPORT_MOST} 条上限，` +
+        `请再次选择同一文件继续导入（已导入的会被自动跳过）`,
+    })
+  }
+
+  return { results, accepted, duplicates, badLines: bad.length }
+}
+
+/**
  * 构建 `auth.import` 钩子。
  *
  * @param {{verify?: (session: string) => Promise<void>, configDir?: string,
@@ -358,75 +468,12 @@ export function makeImportHook(opts = {}) {
      * @returns {Promise<object[]>} 一组登录结果（与 authorize 的产出同形）
      */
     async import(texts, ctx = {}) {
-      const list = Array.isArray(texts) ? texts.filter((t) => typeof t === "string" && t.trim()) : []
-      if (list.length === 0) return []
-
-      // ── ① 先把自己的文件全部摊平（一次最多 IMPORT_MOST，但**计数要真实**）──
-      //
-      // ⚠ 旧实现在循环里直接 `slice(0, 100)`，被切掉的部分不报错、不提示 ——
-      // 用户导 117 条，17 条永远进不来（再导一次还是切前 100 条）。
-      // 现在改成：摊平 → 去重 → 截断时**追加一条 failed 说明**。
-      /** @type {string[]} */
-      const items = []
-      for (const text of list) {
-        if (ctx.signal?.aborted) break
-        const parsed = extractItems(text)
-        for (const item of parsed.items) items.push(item)
-      }
-
-      // ── ② 去重：已经在 magpie 里的账号不要再返回 ──
-      //
-      // 这是「分两次导完」的前提：用户第二次选同一个文件时，前 100 个会被跳过。
-      // 判据是 uid **或** session —— 同一个号可能以不同 uid 形态出现
-      // （`userid` / 派生的 uid），但 session 只有一个。
-      const existing = readExistingAccounts(configDir)
-      const seenUid = new Set(existing.uids)
-      const seenSession = new Set(existing.sessions)
-
-      /** @type {object[]} */
-      const fresh = []
-      let duplicates = 0
-      for (const item of items) {
-        if (ctx.signal?.aborted) break
-        const result = await toSignInResult(item, { verify: opts.verify })
-        if (result.type === "success") {
-          const session = String(result.access ?? "")
-          const uid = String(result.uid ?? "")
-          if ((session && seenSession.has(session)) || (uid && seenUid.has(uid))) {
-            duplicates += 1
-            continue
-          }
-          if (session) seenSession.add(session)
-          if (uid) seenUid.add(uid)
-        }
-        fresh.push(result)
-      }
-
-      // 一条都没解析出来：给一条 failed 说明原因，而不是静默返回空数组。
-      // 静默的空结果在界面上表现为「点了导入，什么都没发生」。
-      if (items.length === 0 && fresh.length === 0) {
-        return [{ type: "failed", error: `没从文件里认出账号（要含 session 字段的 JSON；provider=${PROVIDER}）` }]
-      }
-      // 全都在池子里了：如实说「没有新账号」，而不是返回空数组让人以为坏了。
-      if (fresh.length === 0) {
-        return [{ type: "failed", error: `这 ${duplicates} 个账号都已经在 magpie 里了，没有新的要导入` }]
-      }
-
-      // ── ③ 截断必须**说清**（magpie 单次只收 IMPORT_MOST 条）──
-      const accepted = fresh.slice(0, IMPORT_MOST)
-      const leftover = fresh.length - accepted.length
-
-      /** @type {object[]} */
-      const results = accepted
-      if (leftover > 0) {
-        results.push({
-          type: "failed",
-          error:
-            `本文件共 ${fresh.length} 条，已导入 ${accepted.length} 条；` +
-            `还有 ${leftover} 条超出 magpie 单次 ${IMPORT_MOST} 条上限，` +
-            `请再次选择同一文件继续导入（已导入的会被自动跳过）`,
-        })
-      }
+      const { results, accepted } = await collectResults(texts, {
+        configDir,
+        verify: opts.verify,
+        signal: ctx.signal,
+      })
+      if (accepted.length === 0) return results
 
       // ── ④ 后台探测（fire-and-forget，绝不 await）──
       //

@@ -31,6 +31,21 @@
 
 import { TASK_DEFS } from "./points.mjs"
 
+// ── 窗口命名的三个前缀（T-31：跨插件统一）────────────────────────────────
+//
+// 规范见 `magpie-plugins/UNIFIED-PLAN.md` §1.1，全部窗口名只能以这三者之一开头：
+//
+//	额度 · <名称>   正常参与路由的额度（有 `used`，或 `balance`+`unit`）
+//	停用 · <原因>   `used: 100` —— 这是**让路由跳过该号**的唯一手段（规范 §4.4）
+//	说明 · <主题>   `aside: true` —— 只解释，不参与路由
+//
+// ⚠ 分隔符固定 ` · `（空格 + U+00B7 + 空格）。名字里**不写数值**
+//   （`剩 N` / `（截至 …）`），magpie 自己会按 amount/limit 算百分比并渲染，
+//   名字里再写一遍就是重复，而且会让窗口在两次刷新之间「改名」。
+export const QUOTA_PREFIX = "额度 · "
+export const STOP_PREFIX = "停用 · "
+export const NOTE_PREFIX = "说明 · "
+
 /**
  * 每日赠送的额度上限（服务端按自然日重置到的那个值）。
  *
@@ -73,18 +88,18 @@ export function nextBeijingMidnight(now = Date.now()) {
  * @param {{available: number, daily: number, dailyKnown: boolean,
  *   permanent: number, permanentKnown: boolean}} points
  * @param {{now?: number, source?: "live"|"cache", updatedAt?: string}} [opts]
- *   `source: "cache"` 时在窗口名后加「(缓存)」，让用户知道这份数字可能过期，
- *   **而不是**把窗口藏掉换成一句话。
+ *   `source: "cache"` 时在**最后一个窗口的 `display` 末尾**标出「截至 MM-DD HH:mm」，
+ *   让用户知道这份数字可能过期，**而不是**把窗口藏掉换成一句话。
+ *   ⚠ 时间戳**不进 `name`**：那会让窗口在「实时 → 缓存」之间变名字，卡片抖动。
  * @returns {object} magpie 的 usage 对象
  */
 export function usageFromPoints(points, opts = {}) {
   const now = opts.now ?? Date.now()
   const cached = opts.source === "cache"
-  const suffix = cached ? " · 缓存" : ""
   /** @type {any[]} */
   const windows = []
 
-  // ① 每日赠送 —— 参与路由
+  // ① 额度 · 每日赠送 —— 参与路由
   if (points.dailyKnown) {
     const remaining = Math.max(0, Number(points.daily) || 0)
     const used =
@@ -92,7 +107,7 @@ export function usageFromPoints(points, opts = {}) {
         ? Math.min(100, Math.max(0, ((DAILY_RESET_AMOUNT - remaining) / DAILY_RESET_AMOUNT) * 100))
         : 0
     windows.push({
-      name: "每日赠送" + suffix,
+      name: `${QUOTA_PREFIX}每日赠送`,
       used,
       resetsAt: nextBeijingMidnight(now),
       span: 86400,
@@ -106,10 +121,10 @@ export function usageFromPoints(points, opts = {}) {
     })
   }
 
-  // ② 永久积分 —— 不参与路由（没有上限，算不出百分比）
+  // ② 说明 · 永久积分 —— 不参与路由（没有上限，算不出百分比）
   if (points.permanentKnown) {
     windows.push({
-      name: "永久积分" + suffix,
+      name: `${NOTE_PREFIX}永久积分`,
       display: `${formatNumber(points.permanent)} 积分`,
       amount: Number(points.permanent) || 0,
       unit: "积分",
@@ -117,10 +132,10 @@ export function usageFromPoints(points, opts = {}) {
     })
   }
 
-  // ③ 可用总额（永久 + 每日）—— 也是 aside，只用于展示「实际能花多少」
+  // ③ 说明 · 可用总额（永久 + 每日）—— 也是 aside，只用于展示「实际能花多少」
   if (points.available !== undefined && points.available !== null) {
     windows.push({
-      name: "可用总额" + suffix,
+      name: `${NOTE_PREFIX}可用总额`,
       display: `${formatNumber(points.available)} 积分`,
       amount: Number(points.available) || 0,
       unit: "积分",
@@ -128,9 +143,10 @@ export function usageFromPoints(points, opts = {}) {
     })
   }
 
-  // 缓存数据：把「截至什么时候」写进窗口名，而不是塞 error
+  // 缓存数据：把「截至什么时候」写进**最后一条窗口的 display**，而不是塞 error
   if (cached && opts.updatedAt && windows.length > 0) {
-    windows[windows.length - 1].name += `（截至 ${shortTime(opts.updatedAt)}）`
+    const last = windows[windows.length - 1]
+    last.display = `${last.display} · 缓存于 ${shortTime(opts.updatedAt)}`
   }
 
   return { windows }
