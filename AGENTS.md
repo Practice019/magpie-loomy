@@ -5,6 +5,37 @@
 
 ---
 
+## 零、先读这条：**不要重启 magpie**
+
+`127.0.0.1:3425` 这个网关**就是 `magpie-windows-amd64` 进程本身**。停它一次，
+所有模型请求立刻全断（DSH、agent 会话、正在跑的对话全部中断）。它不是
+「重启一下就好」的进程，它是**生产流量入口**。
+
+**改完怎么生效：**
+
+```
+1. 改代码 → npm test 全绿
+2. git commit + 打 tag + git push（github:Practice019/magpie-loomy）
+3. 用户在 magpie 界面点「更新」→ 热加载，不重启
+```
+
+**反例（都真实发生过，别再犯）：**
+
+| 错误做法 | 后果 |
+|---|---|
+| `Stop-Process` 后重启 magpie | 模型中断 2~3 秒，进行中的请求全失败 |
+| 改完本地 `plugins/node_modules` 就以为生效 | 下次拉取被 GitHub 旧版覆盖，改动全丢 |
+| 改完仓库但**没 push** 就重启 | 重启拉回旧代码，改动同样全丢 |
+
+**永远不要**：`Stop-Process` / `Start-Process` 任何 `magpie*`、手改
+`plugins/node_modules/**`、手改 `plugin-providers.json`（运行中进程会覆盖它）。
+
+**验证下发内容用字节数，不要用 `.Length`**：`Get-Content -Raw` 得到的是**字符数**，
+中文 UTF-8 每字 3 字节，会让人把「59,766 字节 / 49,152 字符」误判成「48 KiB 截断」。
+逐字节比对请用 `[IO.File]::ReadAllBytes()`。
+
+---
+
 ## 一、先定位你在哪一步
 
 | 你在做什么 | 先读 | 做完的判据 |

@@ -2,7 +2,7 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { join, dirname } from "node:path"
 import { request } from "node:http"
 import { startServer } from "../server.mjs"
 import { TASK_DEFS } from "../src/points.mjs"
@@ -70,7 +70,19 @@ async function fixture(t, handler, count = 3, options = {}) {
     req.on("error", reject)
     req.end(body === undefined ? undefined : typeof body === "string" ? body : JSON.stringify(body))
   })
-  return { api, raw, calls, dir, restart: async () => { await server.close(); server = await startServer(opts) } }
+  // ⚠ `raw()` 用 `text += chunk` 拼的是**字符串**（二进制会被隐式转码），
+  //    所以「发出去多少字节」必须另开一个按 Buffer 收的通道，否则测出来的
+  //    是字符数而不是字节数 —— 这正是 48 KiB 误判的来源。
+  const rawBytes = (method, path) => new Promise((resolve, reject) => {
+    const req = request({ host: "127.0.0.1", port: server.port, path, method }, (res) => {
+      const chunks = []
+      res.on("data", (chunk) => { chunks.push(Buffer.from(chunk)) })
+      res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }))
+    })
+    req.on("error", reject)
+    req.end()
+  })
+  return { api, raw, rawBytes, calls, dir, restart: async () => { await server.close(); server = await startServer(opts) } }
 }
 
 test("Origin null JSON POST 的预检无副作用并可执行初始化", async (t) => {
@@ -399,4 +411,76 @@ test("bulk 运行时拒绝批量和单账号绑定重叠", async (t) => {
     assert.equal((await f.api("/api/do", { action: "bind-invite", uid: "u1", code: "A" })).ok, false)
   } finally { release() }
   assert.equal((await pending).bound, 1)
+})
+
+// ── 静态资源必须**完整下发**（T-50：48 KiB 疑云的回归钉） ─────────────────
+//
+// # 这一集在钉什么
+//
+// 有人报「`/assets/app.js` 只发出 49,152 字符 = 48 KiB，被截断」。实测后：
+//   ① 服务端发的是**字节**。59,766 B 的 app.js 解码成字符串正好是 49,152 个
+//      **字符**（中文 1 字符 = 3 字节）—— 那个「整数 48 KiB」是字符数，
+//      **不是**截断点。字节数一个都不少（sha256 与磁盘一致）。
+//   ② 但原实现不带 `Content-Length`（走 chunked）。一旦中间层/WebView 提前
+//      收尾，前端拿到的就是半截 JS（SyntaxError ⇒ 整段脚本不执行 ⇒ 表现正是
+//      「代码改了，浏览器里还是旧行为」）。
+//
+// 所以这里钉三件事，且一律用**逐字节 sha256** 比对，不只看长度：
+//   · 200 KB / 600 KB 的静态文件字节数与内容都必须与磁盘一致；
+//   · 真实 `page/assets/app.js`（>60 KB）下发长度 == 磁盘长度；
+//   · 响应必须带 `Content-Length`（等于**字节数**，不是字符数）且不再走 chunked。
+
+/** 造一个长度可控的假静态文件（ASCII 填充，内容可哈希），用完删掉。 */
+function writeTempAsset(assetsDir, size) {
+  const name = `__probe-${size}-${Math.random().toString(36).slice(2)}.bin`
+  const file = join(assetsDir, name)
+  writeFileSync(file, Buffer.alloc(size, 0x42))
+  return { name, file }
+}
+
+test("静态文件 200KB / 600KB：字节数与 sha256 都必须与磁盘一致，且带 Content-Length", async (t) => {
+  const { createHash } = await import("node:crypto")
+  const sha = (buf) => createHash("sha256").update(buf).digest("hex")
+  const assetsDir = join(dirname(new URL("../page/assets/app.js", import.meta.url).pathname.slice(1)), "")
+  const f = await fixture(t, undefined, 1)
+
+  for (const size of [200 * 1024, 600 * 1024]) {
+    const { name, file } = writeTempAsset(assetsDir, size)
+    t.after(() => { try { rmSync(file) } catch {} })
+    const res = await f.rawBytes("GET", `/assets/${name}`)
+    const disk = readFileSync(file)
+    assert.equal(res.status, 200, `${size}B：必须能取到`)
+    assert.equal(Number(res.headers["content-length"]), size, `${size}B：Content-Length 必须是字节数`)
+    assert.equal(res.headers["transfer-encoding"], undefined, `${size}B：给了长度就不该再走 chunked`)
+    assert.equal(res.body.length, size, `${size}B：收到的字节数必须等于磁盘长度`)
+    assert.equal(sha(res.body), sha(disk), `${size}B：内容必须逐字节一致`)
+  }
+})
+
+test("真实 page/assets/app.js（>60KB）下发长度 == 磁盘长度，且逐字节一致", async (t) => {
+  const { createHash } = await import("node:crypto")
+  const sha = (buf) => createHash("sha256").update(buf).digest("hex")
+  const diskFile = new URL("../page/assets/app.js", import.meta.url)
+  const disk = readFileSync(diskFile)
+  assert.ok(disk.length > 60 * 1024, `app.js 现在只有 ${disk.length}B，这集的意义（>60KB）就没了`)
+  const f = await fixture(t, undefined, 1)
+  const res = await f.rawBytes("GET", "/assets/app.js")
+  assert.equal(res.status, 200)
+  assert.equal(Number(res.headers["content-length"]), disk.length, "Content-Length 必须等于磁盘字节数")
+  assert.equal(res.body.length, disk.length, `下发 ${res.body.length}B ≠ 磁盘 ${disk.length}B`)
+  assert.equal(sha(res.body), sha(disk), "内容必须逐字节一致")
+})
+
+test("含中文的 index.html：Content-Length 用的是字节数而不是字符数", async (t) => {
+  const diskFile = new URL("../page/index.html", import.meta.url)
+  const raw = readFileSync(diskFile, "utf8")
+  // 端口替换只会改变数字长度；只要源文件里的 4391 是 4 位、替换成 4~5 位，
+  // 长度差最多 1 个字节 × 出现次数。用「字符数 < 字节数」这个铁律来钉判据。
+  assert.ok(raw.length < Buffer.byteLength(raw, "utf8"), "这集的前提：index.html 里有中文（字符 < 字节）")
+  const f = await fixture(t, undefined, 1)
+  const res = await f.rawBytes("GET", "/index.html")
+  assert.equal(res.status, 200)
+  const cl = Number(res.headers["content-length"])
+  assert.equal(cl, res.body.length, "Content-Length 必须等于实际发出的字节数（用 str.length 会算小）")
+  assert.ok(cl > raw.length, `Content-Length(${cl}) 必须大于字符数(${raw.length})，否则就是拿字符数当字节数了`)
 })

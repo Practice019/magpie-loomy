@@ -2652,11 +2652,40 @@ function sendFile(res, file, type, port = 0) {
   const body = type.startsWith("text/html")
     ? readFileSync(file, "utf8").replaceAll("http://127.0.0.1:4391/", `http://127.0.0.1:${port || res.socket?.localPort || DEFAULT_PORT}/`)
     : readFileSync(file)
+  // ⚠ **必须显式给 Content-Length**（字节数，不是字符数）。
+  //
+  // 实测（node 24.15 / bun 1.4.4，两种运行时各起一个服务、两种客户端各发一次）：
+  // 原来的 `res.end(body)` **没有**丢字节 —— 75,906 B 的 app.js 收到 75,906 B、
+  // sha256 逐字节相同。所以「服务端把大文件截断」这个结论**不成立**。
+  //
+  // 但原来的响应走的是 `Transfer-Encoding: chunked`（无 `Content-Length`），
+  // 这带来两个真实代价：
+  //   ① 中间层 / WebView 只要提前收尾，前端拿到的就是半截 JS（`SyntaxError`
+  //      ⇒ 整段脚本不执行 ⇒ 表现正是「改了代码但浏览器里还是旧行为」）；
+  //   ② 没有长度可对，**字符数**极易被当成**字节数**：中文 1 字符 = 3 字节，
+  //      59,766 B 的 app.js 解码后正好是 49,152 个字符 —— 这个「整数 48 KiB」
+  //      是这么来的，不是被截断成了 48 KiB。
+  //
+  // 给出长度之后，客户端/浏览器能自己判断有没有收全；分块写避免一次
+  // `end(hugeBuffer)` 在个别运行时上退化成长时间同步写。
+  //
+  // ⚠ HTML 分支的 body 是**字符串**：`Buffer.byteLength()` 才是要发的字节数；
+  //    用 `str.length` 会让 Content-Length 小于真实字节（比重更大）。
+  const payload = Buffer.isBuffer(body) ? body : Buffer.from(body, "utf8")
   res.writeHead(200, {
     "Content-Type": type,
+    "Content-Length": String(payload.length),
     ...commonHeaders(port || res.socket?.localPort || 0),
   })
-  res.end(body)
+  const CHUNK = 64 * 1024
+  if (payload.length <= CHUNK) {
+    res.end(payload)
+    return
+  }
+  for (let offset = 0; offset < payload.length; offset += CHUNK) {
+    res.write(payload.subarray(offset, Math.min(offset + CHUNK, payload.length)))
+  }
+  res.end()
 }
 
 function guessType(p) {
