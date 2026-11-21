@@ -961,22 +961,53 @@ $("#logs-copy").addEventListener("click", async () => {
     toast("日志已复制")
   } catch { toast("复制失败，剪贴板不可用或权限被拒绝，请在日志页手动选择复制。", true) }
 })
-// ⚠ 危险操作：先二次确认。清空的只是**检测结果**（不会碰 magpie 的账号数据）
 $("#route-apply").addEventListener("click", () => { void applyJudgement() })
-$("#route-reset").addEventListener("click", () => {
-  const total = state.route.size || state.accounts.length
-  // confirm 在测试/无头环境里可能不存在：不存在就当「未确认」，绝不静默清空
-  const ok = typeof confirm === "function"
-    ? confirm(`将清空全部 ${total} 条检测结果（不影响 magpie 的账号数据），确定吗？`)
-    : false
-  if (!ok) return
+
+/**
+ * 「重新检测不健康账号」：把「不健康 → 健康」这条路补上。
+ *
+ * # 为什么不需要「清空检测结果」了
+ *
+ * 判定一旦落盘就再也不会被推翻 —— 那正是当初需要「清空」的原因：除了把记录
+ * 删掉重来，没有别的办法让一个号重新被判定。有了这个按钮，两条路都通了：
+ *
+ *	健康 → 不健康：用着的时候自动标（by-turn / 账本）
+ *	不健康 → 健康：点这里重测，恢复的号会被改回 `clean`
+ *
+ * 所以「清空」这个破坏性操作被删掉了：它不是功能，是一个缺口。
+ *
+ * ⚠ 只筛「有记录且非 clean」的号：**没有检测记录不等于不健康**，把它们一起
+ * 拉进来等于变相做全量检测（301 次调用），那就退回成「清空」了。
+ */
+$("#route-recheck-unhealthy").addEventListener("click", () => {
+  if (state.busy || state.batch.running) return
+  const unhealthy = []
+  for (const [uid, entry] of state.route) {
+    const verdict = String(entry?.verdict ?? "")
+    if (verdict && verdict !== "clean") unhealthy.push(uid)
+  }
+  if (!unhealthy.length) {
+    log("路由", "没有需要重新检测的账号（不健康账号为 0）")
+    toast("没有需要重新检测的账号")
+    return
+  }
   void busy(async () => {
-    const result = await api("/api/route-state/reset", {})
-    state.route = new Map()
-    state.batch = { ...state.batch, finished: false, failed: [] }
-    log("路由", `已清空检测结果：删除 ${result.removed} 条，剩余 ${result.remaining} 条`)
-    toast(`已清空 ${result.removed} 条检测结果`)
+    log("路由", `重新检测 ${unhealthy.length} 个不健康账号…`)
+    // `skipChecked: false` 是这条路的全部：已检测过的号**必须**重新测，
+    // 否则服务端会按「已有结论」把它们全跳过（那就什么都不会发生）。
+    const started = await api("/api/route-check-batch", { uids: unhealthy, skipChecked: false })
+    if (!started.jobId) {
+      log("路由", started.message || "没有需要检测的账号")
+      render()
+      return
+    }
+    state.batch = {
+      jobId: started.jobId, running: true, finished: false,
+      total: started.total, done: 0, okCount: 0, failCount: 0,
+      skipped: new Set(started.skipped ?? []), failed: [], stopped: "", recheck: true,
+    }
     render()
+    scheduleBatchPoll()
   }, "路由")
 })
 for (const type of ["account", "invite"]) {

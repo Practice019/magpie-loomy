@@ -159,10 +159,15 @@ test("reset 参数校验：非数组 → 400，空数组 → 400，模块未就�
   assert.equal((await g.call("POST", "/api/route-state/reset", {})).status, 503)
 })
 
-test("按钮与 confirm 文案：按钮存在且是危险样式，确认文案写清条数与「不影响账号数据」", () => {
+test("面板不再提供「清空检测结果」；改为「重新检测不健康账号」（不健康 → 健康这条路）", () => {
   const html = readPage(new URL("../page/index.html", import.meta.url), "utf8")
   const js = readPage(new URL("../page/assets/app.js", import.meta.url), "utf8")
-  assert.match(html, /<button id="route-reset" class="danger">清空检测结果<\/button>/)
-  assert.match(js, /confirm\(`将清空全部 \$\{total\} 条检测结果（不影响 magpie 的账号数据），确定吗？`\)/)
-  assert.match(js, /"\/api\/route-state\/reset"/)
+  // 清空是「判定无法推翻」的补丁；补上重测之后它就没有存在意义了。
+  assert.doesNotMatch(html, /route-reset/)
+  assert.doesNotMatch(html, /清空检测结果/)
+  assert.doesNotMatch(js, /route-reset/)
+  // 新按钮：只筛「有记录且非 clean」，且必须 skipChecked:false（否则全被跳过）。
+  assert.match(html, /<button id="route-recheck-unhealthy"/)
+  assert.match(html, /重新检测不健康账号/)
+  assert.match(js, /skipChecked: false/)
 })
