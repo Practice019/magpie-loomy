@@ -2279,6 +2279,10 @@ async function runPoolScan(ctx, job, list, options = {}) {
  *      「大码没用完、小码过期」的尴尬状态；
  *   ② 同为有限次数时，`left` 大的优先；
  *   ③ 同一个码可以连续配给多个未绑号（按 `left` 递减）。
+ *
+ * ⚠ pair 必须带 `ownerUid`：绑定成功后要靠它把「码的 usedCount +1」写回
+ *   **持有者**的邀请缓存（T-56，见 `markInviteCacheBound`）。只给 `code`
+ *   的话，写回时只能全表扫一遍找持有者 —— 补个字段就够，别让下游去猜。
  */
 export function planInviteAssignments(pool, wantedUids) {
   const unbound = Array.isArray(pool?.unbound) ? pool.unbound : []
@@ -2319,6 +2323,89 @@ function dropPoolCode(configDir, code) {
     hit.left = 0
     writeInvitePool(configDir, pool)
   } catch {}
+}
+
+/**
+ * T-56：绑定成功后就地更新**「邀请」页缓存**，否则「汇总」还是旧数字。
+ *
+ * # 为什么必须写这一份
+ *
+ * 「汇总」（`runPoolScan`）读的是 `loomy-invite-cache.json` 的
+ * `codes[ownerUid].codes[]`，用 `left = maxUses - usedCount` 算余量。
+ * `consumePoolCode` 只改 `loomy-invite-pool.json`，而下一轮汇总会用淘汰缓存
+ * 把池**整份覆盖**回去 —— 所以绑定不写这一份，汇总永远显示旧余量
+ * （用户现场：82 个号真的绑成功，再汇总又冒出 82 次可用）。
+ *
+ * 做两件事：
+ *   ① 码的持有者（`ownerUid`）名下、`code` 那一枚：`usedCount += 1`，
+ *      `maxUses > 0 && usedCount >= maxUses` ⇒ `status = "exhausted"`；
+ *      ⚠ `maxUses === 0` = **不限次数**：只加 `usedCount`，**绝不**改 status。
+ *   ② 被绑号（`boundUid`）名下：`activation = { activated: true, applied: code }`。
+ *
+ * ⚠ 上游已经绑成功了 —— 这里写盘失败**只记日志**，绝不把绑定结果改判成失败。
+ *   缓存写坏一个号的数字，比「明明绑上了却报失败让人重试」轻得多。
+ *
+ * @param {string} [configDir]
+ * @param {string} ownerUid 码的持有者 uid（`planInviteAssignments` 配对时带出来的）
+ * @param {string} code 用掉的那枚码
+ * @param {string} boundUid 被绑定的那个号
+ * @param {{ log?: { warn?: (msg: string) => void } }} [ctx] 只用来记一句日志
+ * @returns {boolean} 成功写回 `true`，任一步失败 `false`（调用方不看它做决策）
+ */
+function markInviteCacheBound(configDir, ownerUid, code, boundUid, ctx) {
+  const owner = String(ownerUid ?? "").trim()
+  const target = String(boundUid ?? "").trim()
+  const used = String(code ?? "").trim()
+  if (!configDir || !used) return false
+  try {
+    // ⚠ 一次读、一次写：多个 uid 的两处改动放进同一个原子写里。
+    //    `writeKeyedCache` 是「读-合并-rename」，连写两次会互相覆盖中间状态。
+    const cache = readInviteCache(configDir)
+    /** @type {Record<string, any>} */
+    const changes = {}
+    const touch = (uid) => {
+      if (!changes[uid]) changes[uid] = { ...(isPlainObject(cache.codes[uid]) ? cache.codes[uid] : {}) }
+      return changes[uid]
+    }
+
+    // ① 码的余量：在持有者的 `codes[]` 里找到那一枚
+    if (owner) {
+      const entry = touch(owner)
+      if (Array.isArray(entry.codes)) {
+        const hit = entry.codes.find((c) => isPlainObject(c) && String(c.code ?? "").trim() === used)
+        if (hit) {
+          const maxUses = Number(hit.maxUses) || 0
+          hit.usedCount = (Number(hit.usedCount) || 0) + 1
+          // maxUses === 0 是不限次数：永远不判 exhausted
+          if (maxUses > 0 && hit.usedCount >= maxUses) hit.status = "exhausted"
+        }
+      }
+    }
+
+    // ② 被绑号：汇总只看邀请缓存里的这一份 activation
+    const markActivated = (uid) => {
+      const entry = touch(uid)
+      entry.activation = { ...(isPlainObject(entry.activation) ? entry.activation : {}), activated: true, applied: used }
+    }
+    if (target) markActivated(target)
+
+    if (!Object.keys(changes).length) return true
+    const at = Date.now()
+    let ok = true
+    for (const [uid, entry] of Object.entries(changes)) {
+      try {
+        writeKeyedCache(configDir, INVITE_CACHE_FILE, "codes", uid, { ...entry, at })
+      } catch (e) {
+        // 一个 uid 写失败不影响别的 uid（它们已经是各自独立的原子写）
+        ok = false
+        ctx?.log?.warn?.(`loomy panel: 邀请缓存回写失败 uid=${uid}（绑定已成功，数字可能要等下次刷新）：${String(e?.message ?? e).slice(0, 200)}`)
+      }
+    }
+    return ok
+  } catch (e) {
+    ctx?.log?.warn?.(`loomy panel: 邀请缓存回写失败（绑定已成功，数字可能要等下次刷新）：${String(e?.message ?? e).slice(0, 200)}`)
+    return false
+  }
 }
 
 /**
@@ -2395,6 +2482,9 @@ async function runAssign(ctx, job, pairs, concurrency) {
           try {
             writeKeyedCache(ctx.configDir, ACTIVATION_CACHE_FILE, "entries", pair.uid, { activated: true, code: pair.code, at: Date.now() })
           } catch {}
+          // T-56：**同时**把结果写回「邀请」页缓存（汇总只读那一份）。
+          //      写盘失败只记日志 —— 上游已经绑成功，不许因此把结果改判成失败。
+          markInviteCacheBound(ctx.configDir, pair.ownerUid, pair.code, pair.uid, ctx)
           consumePoolCode(ctx.configDir, pair.code)
           result = { status: "bound", code: pair.code, inviterReward: detail.inviterReward, inviteeReward: detail.inviteeReward }
         }
