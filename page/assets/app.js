@@ -394,6 +394,26 @@ async function checkBatchSelected() {
   }
 }
 
+/**
+ * 任务查不到了 —— 不是失败，是**任务已经不在内存里**。
+ *
+ * # 真机现象（2026-11-21）
+ *
+ * 邀请刷新跑到一半，日志先是一串 `✓ 手机号`，两秒后突然
+ * `进度查询失败：没有这个刷新任务` 并弹一个红色 toast。
+ *
+ * 原因：刷新任务表是**面板服务的进程内存**（`ctx.refreshJobs`）。插件更新、
+ * 宿主重启、服务换端口都会让它清空 —— 此时页面还拿着旧 jobId 在轮询，服务端
+ * 只会答「没有这个刷新任务」。任务本身**可能已经跑完**（结果都写进缓存了），
+ * 拿它报「失败」是在骗人。
+ *
+ * 所以：停轮询、不打红字、回读一次缓存把界面更新到最新（任务成功的那部分
+ * 结果本来就在缓存里）。只有真正的上游错误才继续报错。
+ */
+function jobGone(e) {
+  return /没有这个刷新任务|没有这个任务/.test(String(e?.message ?? e ?? ""))
+}
+
 async function pollBatch() {
   const current = state.batch
   if (!current.running || !current.jobId) return
@@ -402,6 +422,13 @@ async function pollBatch() {
     job = (await api("/api/route-check-batch?jobId=" + encodeURIComponent(current.jobId))).job
   } catch (e) {
     state.batch = { ...current, running: false, finished: false }
+    if (jobGone(e)) {
+      log("路由", "批量检测任务已不在内存里（服务重启或已收尾），回读缓存状态")
+      render()
+      try { await routeStates() } catch {}
+      render()
+      return
+    }
     log("路由", `批量检测进度查询失败：${e.message}`)
     toast(`批量检测进度查询失败：${e.message}`, true)
     render()
@@ -589,6 +616,19 @@ async function pollJob(kind) {
     job = (await api(JOB_PATH[kind] + "?jobId=" + encodeURIComponent(current.jobId))).job
   } catch (e) {
     state.jobs[kind] = { ...current, running: false, jobId: "" }
+    if (jobGone(e)) {
+      // 任务表在服务进程内存里：插件更新 / 宿主重启会把它清空，而任务结果
+      // 早已写进缓存。回读缓存即可，不该报红（见 jobGone 的说明）。
+      log(JOB_LABEL[kind], "任务已不在内存里（服务重启或已收尾），回读缓存状态")
+      render()
+      try {
+        if (kind === "balance" || kind === "usage") await balances()
+        else if (kind === "tasks") await tasks()
+        else await invites()
+      } catch {}
+      render()
+      return
+    }
     log(JOB_LABEL[kind], `进度查询失败：${e.message}`)
     toast(`${JOB_LABEL[kind]}刷新进度查询失败：${e.message}`, true)
     render()
@@ -1268,6 +1308,11 @@ function scheduleAssignPoll(kind, jobId) {
     } catch (e) {
       assignState.job = null
       renderAssign()
+      if (jobGone(e)) {
+        log("分配", "任务已不在内存里（服务重启或已收尾），回读码池缓存")
+        try { await poolState() } catch {}
+        return
+      }
       log("分配", `进度查询失败：${e.message}`)
       toast(`分配进度查询失败：${e.message}`, true)
     }
