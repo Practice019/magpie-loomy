@@ -34,6 +34,25 @@
 中文 UTF-8 每字 3 字节，会让人把「59,766 字节 / 49,152 字符」误判成「48 KiB 截断」。
 逐字节比对请用 `[IO.File]::ReadAllBytes()`。
 
+### 发现 magpie 重启了，先别怪人
+
+它自己会升级：`settings.json` 的 `updateEvery`（默认 360 分钟）到点就去 GitHub
+看新版，下载成 `magpie-windows-amd64.exe.new`，替换后重启自己。升级日志会写：
+
+```
+%LOCALAPPDATA%\magpie\logs\app.log
+  magpie <版本> started (app, pid …)
+  update: … .exe.new goes on without its GitHub build attestation checked
+```
+
+判断顺序：
+1. 先看 `app.log` 里有没有 `update:` 与新的 `started` 行 —— 有 = 自更新，与本项目无关
+2. 再看版本号有没有变（升级前 0.1.4501 → 升级后 0.1.4624）
+3. 两者都不成立，才怀疑有人手工重启
+
+**要关掉自动升级**：在 magpie 设置界面改（不要手改 `settings.json` —— 运行中的进程会覆盖它）：
+把「自动检查更新」关掉，或把 `updateEvery` 设为 0。
+
 ---
 
 ## 一、先定位你在哪一步
