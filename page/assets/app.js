@@ -374,6 +374,7 @@ async function checkBatchSelected() {
       jobId: started.jobId,
       running: true,
       finished: false,
+      logged: new Set(),
       total: started.total,
       done: 0,
       okCount: 0,
@@ -407,8 +408,29 @@ async function pollBatch() {
     return
   }
   // 只合并**已完成**的号（服务端的 results 本来就不含进行中的）
+  //
+  // ⚠ 每条都要写一行日志（用户要求）：批量 200+ 个号跑几分钟，只看到一个
+  // 「96/226」的数字，出了问题是哪个号、变成了什么，事后完全查不出来。
+  // 这里按「本次新完成的」逐条记，并把**判定变化**单独标出来 —— 重测的意义
+  // 就是看谁从坏变好，那条必须一眼可见。
   for (const [uid, entry] of Object.entries(job?.results ?? {})) {
-    if (entry && typeof entry === "object") state.route.set(uid, entry)
+    if (!entry || typeof entry !== "object") continue
+    const before = String(state.route.get(uid)?.verdict ?? "")
+    state.route.set(uid, entry)
+    const after = String(entry.verdict ?? "")
+    const label = String(entry.label ?? after ?? "?")
+    const served = String(entry.servedModel ?? "").trim()
+    if (state.batch.logged?.has(uid)) continue
+    ;(state.batch.logged ??= new Set()).add(uid)
+    const changed = before && after && before !== after
+    const tail = served ? `（实际 ${served}）` : ""
+    if (changed) {
+      log("路由", `✓ ${uid} 判定变化：${before} → ${after} ${label}${tail}`)
+    } else if (after === "clean") {
+      log("路由", `✓ ${uid} 正常${tail}`)
+    } else {
+      log("路由", `✗ ${uid} ${label}${tail}`)
+    }
   }
   state.batch = {
     jobId: job.jobId,
@@ -552,7 +574,7 @@ function scheduleJobPoll(kind, delay = JOB_POLL_MS) {
 /** 启动一个刷新任务（`uids` 省略 = 全部账号）。 */
 async function startJob(kind, uids) {
   const started = await api(JOB_PATH[kind], uids && uids.length ? { uids } : {})
-  state.jobs[kind] = { jobId: started.jobId, running: true, done: 0, total: started.total, okCount: 0, failCount: 0, stopped: "" }
+  state.jobs[kind] = { jobId: started.jobId, running: true, done: 0, total: started.total, okCount: 0, failCount: 0, stopped: "" } logged: new Set(),
   log(JOB_LABEL[kind], `开始刷新 ${started.total} 个账号（服务端限速：并发 2 + 每次 300ms）`)
   render()
   void pollJob(kind)
@@ -580,6 +602,22 @@ async function pollJob(kind) {
     okCount: job.okCount,
     failCount: job.failCount,
     stopped: job.stopped || "",
+  }
+  // 逐条日志（用户要求）：与批量检测同一套做法 —— 只记「本次新完成的」，
+  // 失败带原因。只显示 `done 96/226` 的话，事后根本查不出是哪个号出的问题。
+  for (const [uid, result] of Object.entries(job?.results ?? {})) {
+    if (!result || typeof result !== "object") continue
+    ;(state.jobs[kind].logged ??= new Set())
+    if (state.jobs[kind].logged.has(uid)) continue
+    state.jobs[kind].logged.add(uid)
+    const who = state.accounts.find((r) => r.uid === uid)?.phone || uid
+    if (result.error || result.ok === false) {
+      log(JOB_LABEL[kind], `✗ ${who}：${result.error || result.message || "失败"}`)
+    } else if (result.message) {
+      log(JOB_LABEL[kind], `✓ ${who}：${result.message}`)
+    } else {
+      log(JOB_LABEL[kind], `✓ ${who}`)
+    }
   }
   if (state.jobs[kind].running) {
     render()
@@ -693,6 +731,10 @@ function render() {
   // 刷新任务进行中：刷新入口一律禁用（避免重复触发、重复扣积分）
   const running = state.batch.running || jobRunning()
   $$("#account-balance, #account-tasks, #invite-refresh, #usage-refresh").forEach((b) => { b.disabled = state.busy || running })
+  // 「重新检测不健康账号」一次会真打 200+ 次模型请求：跑到一半再点一次 =
+  // 同一批号被并发检测两遍，白扣积分还可能被上游限流。所以只要批量在跑就禁用。
+  const recheck = $("#route-recheck-unhealthy")
+  if (recheck) recheck.disabled = state.busy || state.batch.running || jobRunning()
   renderBatch()
   renderJobs()
 }
@@ -1004,7 +1046,7 @@ $("#route-recheck-unhealthy").addEventListener("click", () => {
     state.batch = {
       jobId: started.jobId, running: true, finished: false,
       total: started.total, done: 0, okCount: 0, failCount: 0,
-      skipped: new Set(started.skipped ?? []), failed: [], stopped: "", recheck: true,
+      skipped: new Set(started.skipped ?? []), failed: [], stopped: "", recheck: true, logged: new Set(),
     }
     render()
     scheduleBatchPoll()
