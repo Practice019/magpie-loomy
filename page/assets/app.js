@@ -1138,9 +1138,11 @@ $("#bind-run").addEventListener("click", () => {
 //      「汇总」= 本地算术（`left = maxUses - usedCount`、`activation.activated`），
 //      一个上游请求都不发；只有「开始分配」才逐号发 1 次绑定请求。
 //   ③ 分配前先干跑，把「会发多少次绑定请求」写在确认框里，不让用户盲点。
-const assignState = { loaded: false, at: 0, codes: [], unbound: [], totals: { poolLeft: 0, unboundCount: 0 }, source: "", cacheAt: 0, missing: 0, job: null }
+const assignState = { loaded: false, at: 0, codes: [], unbound: [], totals: { poolLeft: 0, unboundCount: 0 }, source: "", cacheAt: 0, missing: 0, job: null, confirmAt: 0, confirmTotal: 0 }
 let assignTimer = 0
 const ASSIGN_POLL_MS = 1500
+// 两次点击确认的有效窗口：原生 `confirm()` 在 WebView 里恒返回 false，只能自己做。
+const ASSIGN_CONFIRM_MS = 10000
 
 // 邀请码分配 tab：**只在用户点开它时**读一次码池缓存（零上游，首屏一个字节不多）
 $("#tab-assign").addEventListener("click", () => {
@@ -1187,6 +1189,13 @@ function renderAssign() {
   const running = job?.running === true
   const scan = $("#assign-scan"); if (scan) scan.disabled = running
   const run = $("#assign-run"); if (run) run.disabled = running || pairs === 0
+  // 两次点击确认：第一次点完按钮改文案，窗口过了自动还原（不给「忘了再点一次」留坑）
+  if (run) {
+    const armed = Number(assignState.confirmAt) || 0
+    const live = armed && Date.now() - armed <= ASSIGN_CONFIRM_MS
+    run.textContent = live ? `再点一次确认（${assignState.confirmTotal} 对）` : "开始分配"
+    run.classList.toggle("danger", Boolean(live))
+  }
   const stop = $("#assign-stop"); if (stop) stop.disabled = !running
   if (job) {
     const tail = job.stopped === "stopped-by-user" ? "（已手动停止）" : job.stopped ? "（上游限流，已停止）" : ""
@@ -1289,10 +1298,21 @@ $("#assign-run")?.addEventListener("click", () => busy(async () => {
   // 干跑：先拿「会配多少对」，用户确认后才真的发绑定请求
   const plan = await api("/api/invite/assign", { dryRun: true })
   if (!plan.total) return toast("没有可配对的账号：先汇总码池", true)
-  const ok = typeof confirm === "function"
-    ? confirm(`将向 ${plan.total} 个未绑账号发起绑定请求（每个号 1 次，绑定后不可撤销）。继续？`)
-    : true
-  if (!ok) return log("分配", `已取消（计划 ${plan.total} 对）`)
+  // ⚠ 不能用原生 `confirm()`：magpie 的面板页跑在 WebView 里，`confirm` 存在但
+  //    恒返回 false（点了跟没点一样），于是每次点「开始分配」都只打一行
+  //    「已取消（计划 82 对）」—— 真机 2026-11-21 就是这个症状。
+  //    改成两次点击确认：第一次把按钮变成「再点一次确认」，窗口内再点才真跑。
+  const now = Date.now()
+  const armedAt = Number(assignState.confirmAt) || 0
+  if (!armedAt || now - armedAt > ASSIGN_CONFIRM_MS) {
+    assignState.confirmAt = now
+    assignState.confirmTotal = plan.total
+    log("分配", `计划 ${plan.total} 对；再点一次「开始分配」确认（${Math.round(ASSIGN_CONFIRM_MS / 1000)} 秒内有效）`)
+    toast(`再点一次确认：${plan.total} 对`)
+    renderAssign()
+    return
+  }
+  assignState.confirmAt = 0
   const started = await api("/api/invite/assign", {})
   if (!started.jobId) return log("分配", started.message || "没有可配对的账号")
   assignState.job = { kind: "assign", jobId: started.jobId, total: started.total, done: 0, okCount: 0, failCount: 0, running: true, stopped: "", results: {} }
