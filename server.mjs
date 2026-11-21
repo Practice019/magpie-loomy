@@ -1696,31 +1696,51 @@ function inviteRefreshState(res, ctx, params) {
 //      永久复用（一个号绑一次就不会变），`activated: false` 只复用 10 分钟。
 //
 // 缓存文件：
-//   `loomy-invite-pool.json`     {at, codes:[{code,ownerKey,ownerUid,ownerName,maxUses,usedCount,left,unlimited,status}], unbound:[{key,uid,name,verdict}]}
-//   `loomy-activation-cache.json` {updatedAt, byUid:{uid:{activated,code,at}}}
+//   `loomy-invite-pool.json`     {at, codes:[{code,ownerKey,ownerUid,ownerName,maxUses,usedCount,left,unlimited,status}], unbound:[{key,uid,name,verdict}], source, cacheAt, missing, warnings}
+//   `loomy-activation-cache.json` {updatedAt, entries:{uid:{activated,code,at}}}
+//
+// # T-52：扫描 = **纯本地汇总**，零上游
+//
+// 「邀请」页刷新时会把 `{codes, activation, at, error}` 整条写进
+// `loomy-invite-cache.json`，也就是说**码池和绑定状态本来就已经在本地了**。
+// 所以「汇总」这一步不得调 `fetchInvitationCodes` / `fetchActivation`：
+//   · 码池：`cache.codes[uid].codes` → `left = maxUses - usedCount`（`exhausted` 不计）；
+//   · 未绑：`cache.codes[uid].activation.activated === false`（分配写的那条更晚就用它）。
+// 缺数据的号默认**跳过 + 记 warnings**（不静默补拉）；要补拉必须显式 `refreshMissing`。
 
 const INVITE_POOL_FILE = "loomy-invite-pool.json"
 const ACTIVATION_CACHE_FILE = "loomy-activation-cache.json"
-/** `activated: false` 的缓存寿命：短，因为「未绑」这个状态会变。 */
-const ACTIVATION_FALSE_TTL_MS = 10 * 60 * 1000
 
 function readActivationCache(configDir) {
   // ⚠ 键名是 `entries`（与写出端、用例、面板三方对齐）：uid → {activated, code, at}
   return readKeyedCache(configDir, ACTIVATION_CACHE_FILE, "entries")
 }
 
-/** 缓存里能直接用的激活状态（null = 不知道，得重新查）。 */
-function cachedActivation(entry) {
-  if (!isPlainObject(entry) || typeof entry.activated !== "boolean") return null
-  if (entry.activated === true) return { activated: true, code: String(entry.code ?? "") }
-  return Date.now() - (Number(entry.at) || 0) <= ACTIVATION_FALSE_TTL_MS
-    ? { activated: false, code: "" }
+/**
+ * 本地能确定的绑定状态（`null` = 本地没有，得补拉）。
+ *
+ * 两个本地来源，**谁更晚用谁**：
+ *   ① `loomy-invite-cache.json` 的 `activation`（「邀请」页刷新写的）；
+ *   ② `loomy-activation-cache.json`（分配成功那一刻写的，比 ① 新）。
+ *
+ * ⚠ 不给 `activated: false` 加 TTL：本地记录就是权威——绑过的号只有
+ *   `runAssign` 能把它改回 `true`，而它同时会把这里更新掉。按过期当"不知道"
+ *   会让大半账号凭空变成"缺数据"，反而逼着去发上游请求。
+ */
+function localActivation(inviteEntry, activationEntry) {
+  const fromInvite = isPlainObject(inviteEntry?.activation) && typeof inviteEntry.activation.activated === "boolean"
+    ? { activated: inviteEntry.activation.activated, code: String(inviteEntry.activation.applied ?? inviteEntry.activation.code ?? ""), at: Number(inviteEntry.at) || 0 }
     : null
+  const fromBind = isPlainObject(activationEntry) && typeof activationEntry.activated === "boolean"
+    ? { activated: activationEntry.activated, code: String(activationEntry.code ?? ""), at: Number(activationEntry.at) || 0 }
+    : null
+  if (fromInvite && fromBind) return fromInvite.at >= fromBind.at ? fromInvite : fromBind
+  return fromInvite ?? fromBind
 }
 
 /** 读邀请码池（缺文件 / 损坏 / 形状不对 → 空池，绝不抛）。 */
 export function readInvitePool(configDir) {
-  const empty = { at: 0, codes: [], unbound: [] }
+  const empty = { at: 0, codes: [], unbound: [], source: "cache", cacheAt: 0, missing: 0, warnings: [] }
   if (!configDir) return empty
   const path = join(configDir, INVITE_POOL_FILE)
   if (!existsSync(path)) return empty
@@ -1757,7 +1777,18 @@ export function readInvitePool(configDir) {
     authKey: String(u.authKey ?? ""),
     verdict: String(u.verdict ?? "unknown"),
   })).filter((u) => u.uid)
-  return { at: Number(parsed.at) || 0, codes, unbound }
+  // 来源标记：让面板能写「码池读自缓存（多久前）、缺几个号」。
+  const source = parsed.source === "cache+live" ? "cache+live" : "cache"
+  const warnings = (Array.isArray(parsed.warnings) ? parsed.warnings : []).filter((w) => typeof w === "string")
+  return {
+    at: Number(parsed.at) || 0,
+    codes,
+    unbound,
+    source,
+    cacheAt: Number(parsed.cacheAt) || 0,
+    missing: Math.max(0, Number(parsed.missing) || 0),
+    warnings,
+  }
 }
 
 function writeInvitePool(configDir, data) {
@@ -1856,6 +1887,9 @@ function startInviteJob(ctx, kind, items) {
     jobId, kind, total: items.length, done: 0, okCount: 0, failCount: 0, skipCount: 0,
     running: true, stopped: "", results: /** @type {Record<string, object>} */ ({}),
     codes: [], unbound: [],
+    // 数据来源标记（T-52）：「汇总」只读 `loomy-invite-cache.json`，
+    // `source` 默认 `cache`；只有显式 `refreshMissing` 补拉过才变 `cache+live`。
+    source: "", cacheAt: 0, missing: 0, warnings: /** @type {string[]} */ ([]),
   }
   ctx.inviteJobs.set(jobId, job)
   return job
@@ -1869,21 +1903,30 @@ function finishInviteJob(ctx, job) {
 
 /** `GET /api/invite/pool` → 只读缓存，零上游。 */
 function invitePoolState(res, ctx) {
-  const pool = ctx.configDir ? readInvitePool(ctx.configDir) : { at: 0, codes: [], unbound: [] }
+  const pool = ctx.configDir ? readInvitePool(ctx.configDir) : readInvitePool("")
   return sendJson(res, 200, {
     ok: true,
     at: pool.at,
     codes: pool.codes,
     unbound: pool.unbound,
     totals: invitePoolTotals(pool),
+    source: pool.source,
+    cacheAt: pool.cacheAt,
+    missing: pool.missing,
+    warnings: pool.warnings,
   })
 }
 
 /**
- * `POST /api/invite/pool/scan`：扫「健康码的码」+ 「未绑账号」，job 化。
+ * `POST /api/invite/pool/scan`：把「码池 + 绑定状态」汇总成池，job 化。
  *
- * 只扫 `verdict === "clean"` 的号去拿码（用户明确：邀请者必须健康）；
- * 激活状态逐号查 `GET /points/activation`，`expired` 默认跳过（号已死，别浪费请求）。
+ * **零上游**：数据全部来自 `loomy-invite-cache.json`（「邀请」页刷新时写的
+ * `{codes, activation, at, error}`），这里只做汇总算术。
+ *
+ * body:
+ *   · `includeExpired: true` → 连 `expired` 的号也一起看（默认跳过：号已死）；
+ *   · `refreshMissing: true` → 本地缺数据的号才补拉（走并发槽 + 节流），
+ *     默认**不补**：缺就跳过并记 `warnings`，绝不静默打上游。
  */
 async function invitePoolScanStart(req, res, ctx) {
   /** @type {any} */
@@ -1899,63 +1942,127 @@ async function invitePoolScanStart(req, res, ctx) {
   const accounts = [...new Map(readMagpieAuth(ctx.configDir).map((a) => [a.uid, a])).values()]
   const wanted = Array.isArray(input.uids) ? new Set(input.uids.map((u) => String(u).trim()).filter(Boolean)) : null
   const list = wanted ? accounts.filter((a) => wanted.has(a.uid)) : accounts
-  if (!list.length) return sendJson(res, 200, { ok: true, jobId: "", total: 0, message: "没有需要扫描的账号" })
+  if (!list.length) return sendJson(res, 200, { ok: true, jobId: "", total: 0, message: "没有需要汇总的账号" })
 
   const settings = readPanelSettings(ctx.configDir).data
   const concurrency = Math.max(1, Math.min(concurrencyFor("invite", settings), list.length))
   const job = startInviteJob(ctx, "scan", list)
-  void runPoolScan(ctx, job, list, input.includeExpired === true, concurrency)
+  void runPoolScan(ctx, job, list, {
+    includeExpired: input.includeExpired === true,
+    refreshMissing: input.refreshMissing === true,
+    concurrency,
+  })
   return sendJson(res, 200, { ok: true, jobId: job.jobId, total: job.total })
 }
 
-async function runPoolScan(ctx, job, list, includeExpired, concurrency) {
+/**
+ * 汇总一次码池：**纯本地计算，零上游**（只有 `refreshMissing` 才补拉）。
+ *
+ * 数据来源只有一个：`loomy-invite-cache.json`（「邀请」页刷新写的
+ * `{codes, activation, at, error}`）；绑定成功那一刻的记录在
+ * `loomy-activation-cache.json`，两者谁更晚用谁（见 `localActivation`）。
+ *
+ * @param {any} ctx
+ * @param {any} job
+ * @param {any[]} list
+ * @param {{ includeExpired?: boolean, refreshMissing?: boolean, concurrency?: number }} [options]
+ */
+async function runPoolScan(ctx, job, list, options = {}) {
+  const includeExpired = options.includeExpired === true
+  const refreshMissing = options.refreshMissing === true
+  const concurrency = Math.max(1, Number(options.concurrency) || 1)
   const verdicts = await routeVerdicts(ctx)
+  const inviteCache = readInviteCache(ctx.configDir)
   const activations = readActivationCache(ctx.configDir).entries
   const keys = authKeyByUid(ctx.configDir)
   let cursor = 0
   let consecutiveRateLimit = 0
+  let missing = 0
+  let liveFetches = 0
   const worker = async () => {
     for (;;) {
       if (job.stopped) return
       const index = cursor++
       if (index >= list.length) return
       const account = list[index]
-      await refreshGate(ctx)
-      if (job.stopped) return
       const entry = isPlainObject(verdicts[account.uid]) ? verdicts[account.uid] : {}
       const verdict = String(entry.verdict ?? "unknown")
       // 健康 = clean + 实际落地不是降级模型（routed 的另一种表现，双保险）
       const healthy = verdict === "clean" && String(entry.servedModel ?? "") !== "spark-x2.6-low"
-      const base = { baseUrl: ctx.baseUrl, auth: { session: account.session }, fetchImpl: ctx.fetchImpl }
       const owner = { key: account.nickname || account.phone || shortUID(account.uid), uid: account.uid, name: account.nickname || shortUID(account.uid), authKey: keys.get(account.uid) ?? "" }
+      const inviteEntry = isPlainObject(inviteCache.codes[account.uid]) ? inviteCache.codes[account.uid] : {}
       let error = ""
+      // ① 码池：本地缓存 → 纯算术（`left = maxUses - usedCount`，`exhausted` 不计）。
+      //    只有「健康号 + 本地没有 codes + 显式 refreshMissing」才补拉一次。
       let codeList = []
+      let codesMissing = false
       if (healthy) {
-        try {
-          codeList = poolCodesOf(owner, await withSlot(ctx, () => fetchInvitationCodes(base)))
-        } catch (e) {
-          error = sanitizeError(e, account.session)
+        const cachedCodes = Array.isArray(inviteEntry.codes) ? inviteEntry.codes : null
+        if (cachedCodes) {
+          codeList = poolCodesOf(owner, cachedCodes)
+        } else if (refreshMissing) {
+          await refreshGate(ctx)
+          if (job.stopped) return
+          try {
+            const live = await withSlot(ctx, () => fetchInvitationCodes({ baseUrl: ctx.baseUrl, auth: { session: account.session }, fetchImpl: ctx.fetchImpl }))
+            liveFetches += 1
+            codeList = poolCodesOf(owner, live)
+            try {
+              writeKeyedCache(ctx.configDir, INVITE_CACHE_FILE, "codes", account.uid, { ...inviteEntry, codes: live, at: Date.now(), error: "" })
+            } catch {}
+          } catch (e) {
+            error = sanitizeError(e, account.session)
+            codesMissing = true
+          }
+        } else {
+          codesMissing = true
         }
       }
-      let activation = cachedActivation(activations[account.uid])
+      // ② 绑定状态：同样只读本地（两个缓存谁更晚用谁）。
+      const skipExpired = verdict === "expired" && !includeExpired
+      let activation = localActivation(inviteEntry, activations[account.uid])
+      let activationMissing = false
       if (!activation) {
-        const skipExpired = verdict === "expired" && !includeExpired
-        if (!skipExpired) {
+        if (skipExpired) {
+          // 号已死：不查、不补、也不记警告（别浪费请求，这是老行为）
+        } else if (refreshMissing) {
+          await refreshGate(ctx)
+          if (job.stopped) return
           try {
-            const got = await withSlot(ctx, () => fetchActivation(base))
+            const got = await withSlot(ctx, () => fetchActivation({ baseUrl: ctx.baseUrl, auth: { session: account.session }, fetchImpl: ctx.fetchImpl }))
+            liveFetches += 1
             activation = { activated: got.activated === true, code: String(got.applied ?? "") }
             try {
               writeKeyedCache(ctx.configDir, ACTIVATION_CACHE_FILE, "entries", account.uid, { activated: activation.activated, code: activation.code, at: Date.now() })
             } catch {}
+            try {
+              writeKeyedCache(ctx.configDir, INVITE_CACHE_FILE, "codes", account.uid, { ...inviteEntry, activation: { activated: activation.activated, applied: activation.code }, at: Date.now(), error: "" })
+            } catch {}
           } catch (e) {
             error = error || sanitizeError(e, account.session)
+            activationMissing = true
           }
+        } else {
+          activationMissing = true
         }
       }
+      // ③ 缺数据：跳过 + 记一句人话。**绝不静默补拉**（补拉要用户显式开关）。
+      const notes = []
+      if (codesMissing) notes.push(`账号 ${account.uid} 缺邀请码缓存，请先在「邀请」页读一次`)
+      if (activationMissing) notes.push(`账号 ${account.uid} 缺绑定状态，请先在「邀请」页读一次`)
+      if (notes.length) {
+        missing += 1
+        for (const note of notes) job.warnings.push(note)
+      }
       for (const c of codeList) job.codes.push(c)
-      // ⚠ 只把**非健康**的未绑号放进 unbound：健康号是供码方，它自己不需要绑别人的码。
+      // ⚠ 未绑号**不限健康与否**：积分归「码的持有者」，不是「谁去绑」。
+      //    健康号之间互相绑定同样有效（A 绑 B 的码 ⇒ B 拿 5000），所以健康的
+      //    未绑号也是可用被邀请者——把它们排除，等于白少一批可配对。
+      //    唯一排除的是 `expired`（号已死，绑了也白烧一个码），`includeExpired` 才放行。
       //    `key` 就用 uid（面板与用例都按 uid 指代账号）。
-      if (activation && activation.activated === false && !healthy) job.unbound.push({ key: account.uid, uid: account.uid, name: owner.name, verdict })
+      if (activation && activation.activated === false && !skipExpired) {
+        job.unbound.push({ key: account.uid, uid: account.uid, name: owner.name, verdict })
+      }
       job.done += 1
       if (error) job.failCount += 1
       else job.okCount += 1
@@ -1965,20 +2072,34 @@ async function runPoolScan(ctx, job, list, includeExpired, concurrency) {
       } else {
         consecutiveRateLimit = 0
       }
-      job.results[account.uid] = { ok: !error, healthy, verdict, activation: activation ? activation.activated : null, codes: codeList.length, error }
+      job.results[account.uid] = {
+        ok: !error, healthy, verdict,
+        activation: activation ? activation.activated : null,
+        codes: codeList.length, error,
+        missing: notes.length > 0,
+      }
     }
   }
   try {
-    await Promise.all(Array.from({ length: Math.max(1, concurrency) }, worker))
+    await Promise.all(Array.from({ length: concurrency }, worker))
   } catch (e) {
-    ctx.log.warn?.(`loomy panel: 邀请码池扫描异常收尾: ${String(e?.message ?? e).slice(0, 200)}`)
+    ctx.log.warn?.(`loomy panel: 邀请码池汇总异常收尾: ${String(e?.message ?? e).slice(0, 200)}`)
   } finally {
+    job.source = liveFetches > 0 ? "cache+live" : "cache"
+    job.cacheAt = liveFetches > 0
+      ? Number(readInviteCache(ctx.configDir).updatedAt) || 0
+      : Number(inviteCache.updatedAt) || 0
+    job.missing = missing
     try {
       const dedup = new Map()
       for (const c of job.codes) dedup.set(`${c.ownerUid}:${c.code}`, c)
       const codes = [...dedup.values()].sort((a, b) => a.ownerUid.localeCompare(b.ownerUid) || a.code.localeCompare(b.code))
       const unbound = [...new Map(job.unbound.map((u) => [u.uid, u])).values()].sort((a, b) => a.uid.localeCompare(b.uid))
-      writeInvitePool(ctx.configDir, { at: Date.now(), codes, unbound })
+      writeInvitePool(ctx.configDir, {
+        at: Date.now(), codes, unbound,
+        source: job.source, cacheAt: job.cacheAt, missing: job.missing,
+        warnings: job.warnings.slice(0, 100),
+      })
     } catch (e) {
       ctx.log.warn?.(`loomy panel: 邀请码池写盘失败: ${String(e?.message ?? e).slice(0, 200)}`)
     }
@@ -2173,6 +2294,11 @@ function readInviteJob(res, ctx, params, kind) {
       running: job.running,
       stopped: job.stopped || "",
       results: job.results,
+      // 汇总的来源标记（面板据此写「码池读自缓存 / 缺几个号」；分配任务为空）
+      source: job.source ?? "",
+      cacheAt: job.cacheAt ?? 0,
+      missing: job.missing ?? 0,
+      warnings: job.warnings ?? [],
     },
   })
 }

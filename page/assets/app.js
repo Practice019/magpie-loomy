@@ -1040,12 +1040,14 @@ $("#bind-run").addEventListener("click", () => {
 })
 // ── 邀请码分配（健康码的码池 → 未绑账号）───────────────────────────
 //
-// 三条硬约束（T-50）：
+// 三条硬约束（T-50 / T-52）：
 //   ① 打开页面**零上游**：这里只读 `GET /api/invite/pool`，而且只在**点开这个 tab**
 //      或用户点按钮时才读；首屏那 5 个 GET 的集合一个字不改。
-//   ② 扫描 / 分配都是用户在页面上点出来的 job，进度靠轮询；
+//   ② **汇总零上游**：码池与绑定状态本来就在 `loomy-invite-cache.json` 里，
+//      「汇总」= 本地算术（`left = maxUses - usedCount`、`activation.activated`），
+//      一个上游请求都不发；只有「开始分配」才逐号发 1 次绑定请求。
 //   ③ 分配前先干跑，把「会发多少次绑定请求」写在确认框里，不让用户盲点。
-const assignState = { loaded: false, at: 0, codes: [], unbound: [], totals: { poolLeft: 0, unboundCount: 0 }, job: null }
+const assignState = { loaded: false, at: 0, codes: [], unbound: [], totals: { poolLeft: 0, unboundCount: 0 }, source: "", cacheAt: 0, missing: 0, job: null }
 let assignTimer = 0
 const ASSIGN_POLL_MS = 1500
 
@@ -1075,7 +1077,20 @@ function renderAssign() {
   }
   setText("#assign-codes-summary", assignState.codes.length ? `${assignState.codes.length} 个码` : "")
   setText("#assign-unbound-summary", assignState.unbound.length ? `${assignState.unbound.length} 个号` : "")
-  setText("#assign-at", assignState.at ? `码池扫描于 ${clock(assignState.at)}（只读缓存；点「扫描码池」才更新）` : "还没扫描过")
+  setText("#assign-at", assignState.at ? `汇总于 ${clock(assignState.at)}（读「邀请」页缓存；点「汇总」才重算）` : "还没汇总过")
+  // 扫描按钮旁那一行字：说清「读自哪、会不会打上游、缺几个号」
+  const missing = Number(assignState.missing) || 0
+  if (!assignState.loaded) {
+    setText("#assign-scan-hint", "全部读自「邀请」页缓存，零上游请求")
+  } else {
+    const live = assignState.source === "cache+live"
+    setText("#assign-scan-hint", [
+      live ? "码池读自「邀请」页缓存（刚补拉过缺的号）" : "全部读自「邀请」页缓存",
+      assignState.cacheAt ? `缓存于 ${clock(assignState.cacheAt)}` : "",
+      live ? "" : "零上游请求",
+      missing > 0 ? `${missing} 个号缺数据（先到「邀请」页读一次）` : "",
+    ].filter(Boolean).join(" · "))
+  }
 
   const job = assignState.job
   const running = job?.running === true
@@ -1084,7 +1099,7 @@ function renderAssign() {
   const stop = $("#assign-stop"); if (stop) stop.disabled = !running
   if (job) {
     const tail = job.stopped === "stopped-by-user" ? "（已手动停止）" : job.stopped ? "（上游限流，已停止）" : ""
-    setText("#assign-hint", `${job.kind === "scan" ? "扫描" : "分配"}中 ${job.done}/${job.total} · 成功 ${job.okCount} · 失败 ${job.failCount}${tail}`)
+    setText("#assign-hint", `${job.kind === "scan" ? "汇总" : "分配"}中 ${job.done}/${job.total} · 成功 ${job.okCount} · 失败 ${job.failCount}${tail}`)
   } else {
     setText("#assign-hint", "")
   }
@@ -1093,7 +1108,7 @@ function renderAssign() {
   if (codesEl) {
     codesEl.innerHTML = assignState.codes.length
       ? `<table><thead><tr><th>邀请码</th><th>所属账号</th><th>已用 / 上限</th><th>剩余</th><th>状态</th></tr></thead><tbody>${assignState.codes.map((c) => `<tr><td class="mono">${esc(c.code)}</td><td title="${esc(c.ownerUid)}">${esc(c.ownerName || c.ownerUid)}</td><td class="mono">${num(c.usedCount)} / ${c.unlimited ? "不限" : num(c.maxUses)}</td><td class="mono">${c.unlimited ? "不限" : num(c.left)}</td><td>${badge(c.unlimited ? "不限次" : "可用", "done")}</td></tr>`).join("")}</tbody></table>`
-      : '<div class="empty">还没有扫描过：点上面的「扫描码池」（这一步会请求上游）</div>'
+      : '<div class="empty">还没有汇总过：点上面的「汇总」（只读本地缓存，零上游）</div>'
   }
 
   const unboundEl = $("#assign-unbound")
@@ -1112,7 +1127,7 @@ function renderAssign() {
           const label = u.verdict === "clean" ? "健康" : u.verdict === "expired" ? "登录失效" : u.verdict === "routed" ? "被限制" : u.verdict === "exhausted" ? "积分不足" : "未检测"
           return `<tr><td title="${esc(u.uid)}">${esc(u.name || u.uid)}</td><td>${badge(label, u.verdict === "clean" ? "done" : "fail")}</td><td>${cell}</td></tr>`
         }).join("")}</tbody></table>`
-      : '<div class="empty">还没有未绑账号的数据：先扫描</div>'
+      : '<div class="empty">还没有未绑账号的数据：先汇总一次（零上游）</div>'
   }
 }
 
@@ -1126,6 +1141,9 @@ function applyPool(result) {
   assignState.codes = Array.isArray(result.codes) ? result.codes : []
   assignState.unbound = Array.isArray(result.unbound) ? result.unbound : []
   assignState.totals = result.totals ?? { poolLeft: 0, unboundCount: 0 }
+  assignState.source = String(result.source ?? "")
+  assignState.cacheAt = Number(result.cacheAt) || 0
+  assignState.missing = Number(result.missing) || 0
   assignState.loaded = true
   renderAssign()
 }
@@ -1143,7 +1161,7 @@ function scheduleAssignPoll(kind, jobId) {
       assignState.job = { ...job, running: false }
       renderAssign()
       log("分配", kind === "scan"
-        ? `码池扫描完成：${job.done}/${job.total}，失败 ${job.failCount}`
+        ? `码池汇总完成：${job.done}/${job.total}，缺数据 ${job.missing ?? 0}，失败 ${job.failCount}（零上游请求）`
         : `分配完成：成功 ${job.okCount}，失败 ${job.failCount}`)
       if (job.stopped && job.stopped !== "stopped-by-user") toast("上游限流，任务已停止", true)
       await poolState()
@@ -1159,12 +1177,12 @@ function scheduleAssignPoll(kind, jobId) {
 $("#assign-scan")?.addEventListener("click", () => busy(async () => {
   const started = await api("/api/invite/pool/scan", {})
   if (!started.jobId) {
-    log("分配", started.message || "没有需要扫描的账号")
+    log("分配", started.message || "没有需要汇总的账号")
     await poolState()
     return
   }
   assignState.job = { kind: "scan", jobId: started.jobId, total: started.total, done: 0, okCount: 0, failCount: 0, running: true, stopped: "", results: {} }
-  log("分配", `开始扫描码池：${started.total} 个账号（只取健康号的码）`)
+  log("分配", `开始汇总码池：${started.total} 个账号（只读「邀请」页缓存，零上游）`)
   renderAssign()
   scheduleAssignPoll("scan", started.jobId)
 }, "分配"))
@@ -1179,7 +1197,7 @@ $("#assign-stop")?.addEventListener("click", () => busy(async () => {
 $("#assign-run")?.addEventListener("click", () => busy(async () => {
   // 干跑：先拿「会配多少对」，用户确认后才真的发绑定请求
   const plan = await api("/api/invite/assign", { dryRun: true })
-  if (!plan.total) return toast("没有可配对的账号：先扫描码池", true)
+  if (!plan.total) return toast("没有可配对的账号：先汇总码池", true)
   const ok = typeof confirm === "function"
     ? confirm(`将向 ${plan.total} 个未绑账号发起绑定请求（每个号 1 次，绑定后不可撤销）。继续？`)
     : true

@@ -3,8 +3,9 @@
 // # 这一集在钉什么
 //
 //	① `GET /api/invite/pool` **只读缓存**：零上游（空缓存 / 有缓存 / 损坏缓存三态）
-//	② `POST /api/invite/pool/scan` 只扫 `verdict === "clean"` 的号取码，
-//	   未绑号一律查 `GET /points/activation`，**跳过 expired**（号已死）
+//	② `POST /api/invite/pool/scan`（汇总）**纯本地**：码池与绑定状态都来自
+//	   `loomy-invite-cache.json`，只把 `verdict === "clean"` 的号的码放进池；
+//	   未绑号取 `activation.activated === false`，**跳过 expired**（号已死）
 //	③ 池的算术：`left = maxUses - usedCount`，`maxUses: 0` = 不限次数，
 //	   `status === "exhausted"` 不计入池
 //	④ `POST /api/invite/assign` 优先消耗 `left` 最大的码；`alreadyActivated` 算跳过
@@ -24,7 +25,22 @@ import { request } from "node:http"
 import { startServer } from "../server.mjs"
 
 const POOL_FILE = "loomy-invite-pool.json"
-const ACTIVATION_FILE = "loomy-activation-cache.json"
+const INVITE_FILE = "loomy-invite-cache.json"
+
+/**
+ * 把「邀请」页缓存预置进 configDir（T-52：汇总的**唯一**数据源）。
+ *
+ * 形状与真实文件一致（`src/points.mjs` 的 `fetchInvitationCodes` 就写这个形状）：
+ * `{updatedAt, codes:{uid:{codes:[{code,usedCount,maxUses,status}], activation:{activated,applied}, at, error}}}`
+ */
+function seedInviteCache(f, entries, updatedAt = 1795053000000) {
+  /** @type {Record<string, any>} */
+  const codes = {}
+  for (const [uid, e] of Object.entries(entries)) {
+    codes[uid] = { codes: e.codes ?? [], activation: e.activation, at: e.at ?? 1795052900000, error: "" }
+  }
+  writeFileSync(join(f.dir, INVITE_FILE), JSON.stringify({ updatedAt, codes }))
+}
 
 const session = (i) => String.fromCharCode(97 + i).repeat(32)
 
@@ -167,13 +183,19 @@ test("② 无缓存（以及缓存损坏）时 GET /api/invite/pool 仍是 200 �
   assert.equal(f.calls.length, 0)
 })
 
-// ── ② 扫描：只扫健康码；未绑号跳过 expired ──────────────────────────────
+// ── ② 汇总：只把健康码的码放进池；未绑号跳过 expired ─────────────────────
+//
+// ⚠ T-52：汇总（`POST /api/invite/pool/scan`）**纯本地**，数据全部来自
+//    `loomy-invite-cache.json`。这一节因此不再往上游取码，改为预置缓存。
 
-test("③ scan 只向 verdict==='clean' 的号取码：routed / expired / exhausted / 未检测一律不碰", async (t) => {
-  const f = await fixture(t, {
-    verdicts: { h1: "clean", h2: "clean", r1: "routed", e1: "expired", x1: "exhausted" },
-    codes: { h1: [{ inviteCode: "AAA111", usedCount: 0, maxUses: 1, status: "active" }] },
-    activation: { r1: { activated: false }, e1: { activated: false } },
+test("③ 汇总只把 verdict==='clean' 的号的码放进池：routed / expired / exhausted 的码一律不进池", async (t) => {
+  const f = await fixture(t, { verdicts: { h1: "clean", h2: "clean", r1: "routed", e1: "expired", x1: "exhausted" } })
+  seedInviteCache(f, {
+    h1: { codes: [{ code: "AAA111", usedCount: 0, maxUses: 1, status: "active" }], activation: { activated: true } },
+    h2: { codes: [{ code: "BBB222", usedCount: 1, maxUses: 6, status: "active" }], activation: { activated: true } },
+    r1: { codes: [{ code: "RRR999", usedCount: 0, maxUses: 6, status: "active" }], activation: { activated: false } },
+    e1: { codes: [{ code: "EEE111", usedCount: 0, maxUses: 6, status: "active" }], activation: { activated: false } },
+    x1: { codes: [{ code: "XXX111", usedCount: 0, maxUses: 6, status: "active" }], activation: { activated: false } },
   })
   const started = await f.call("POST", "/api/invite/pool/scan", {})
   assert.equal(started.status, 200)
@@ -181,50 +203,43 @@ test("③ scan 只向 verdict==='clean' 的号取码：routed / expired / exhaus
   const job = await waitJob(f, "/api/invite/pool/scan", started.body.jobId)
   assert.equal(job.running, false)
 
-  const codeTokens = f.getCodes().map((c) => c.token)
-  assert.ok(codeTokens.length > 0, "健康码必须被扫到")
-  assert.ok(codeTokens.includes(f.tokenOf("h1")) && codeTokens.includes(f.tokenOf("h2")), "clean 的号要取码")
-  for (const uid of ["r1", "e1", "x1"]) {
-    assert.ok(!codeTokens.includes(f.tokenOf(uid)), `${uid} 不是健康号，绝不能向它取码（用户明确「邀请者必须是健康的」）`)
-  }
-  // expired 的号连 activated 都不查（号已死，别浪费请求）
-  // ⚠ 只对 expired 跳查：routed / exhausted 仍需查激活状态才能进 unbound（见 ③b）。
-  const hitTokens = f.getActivation().map((c) => c.token)
-  assert.ok(!hitTokens.includes(f.tokenOf("e1")), "e1 不该被查激活状态（号已死，别浪费请求）")
+  const pool = f.readJson(POOL_FILE)
+  assert.deepEqual(pool.codes.map((c) => c.code), ["AAA111", "BBB222"], "只有健康码的码能进池（邀请者必须健康）")
+  assert.deepEqual(f.getCodes(), [], "汇总不得向上游取码")
+  assert.deepEqual(f.getActivation(), [], "汇总不得向上游查绑定状态")
+  assert.equal(job.source, "cache", "来源必须是本地缓存")
 })
 
-test("③b scan 把未绑号写进池：activated=false 进 unbound，已绑的不进；expired 不查 activation", async (t) => {
-  const f = await fixture(t, {
-    verdicts: { h1: "clean", r1: "routed", r2: "routed", e1: "expired" },
-    codes: { h1: [{ inviteCode: "AAA111", usedCount: 0, maxUses: 1, status: "active" }] },
-    activation: { r1: { activated: false }, r2: { activated: true, appliedInvitationCode: "V5GZ3M" }, e1: { activated: false } },
+test("③b 汇总把未绑号写进池：activation.activated=false 的号都进（含健康号）；已绑 / expired 不进", async (t) => {
+  const f = await fixture(t, { verdicts: { h1: "clean", r1: "routed", r2: "routed", e1: "expired" } })
+  seedInviteCache(f, {
+    h1: { codes: [{ code: "AAA111", usedCount: 0, maxUses: 1, status: "active" }], activation: { activated: false } },
+    r1: { codes: [], activation: { activated: false } },
+    r2: { codes: [], activation: { activated: true, applied: "V5GZ3M" } },
+    e1: { codes: [], activation: { activated: false } },
   })
   const started = await f.call("POST", "/api/invite/pool/scan", {})
   await waitJob(f, "/api/invite/pool/scan", started.body.jobId)
   const pool = f.readJson(POOL_FILE)
-  assert.ok(pool, "扫描必须落盘 loomy-invite-pool.json")
-  assert.deepEqual(pool.unbound.map((u) => [u.key, u.verdict]), [["r1", "routed"]], "只有明确未绑的号进池")
-  // 已绑的号写进 activation 缓存，下次不再重复查
-  const activation = f.readJson(ACTIVATION_FILE)
-  assert.equal(activation.entries.r2.activated, true)
-  assert.equal(activation.entries.r2.code, "V5GZ3M")
-  assert.equal(activation.entries.r2.at > 0, true)
+  assert.ok(pool, "汇总必须落盘 loomy-invite-pool.json")
+  // 未绑号**不限健康与否**（T-52 收尾：积分归「码的持有者」，健康未绑号也能当被邀请者）：
+  // h1 健康未绑 → 进；r1 未绑 → 进；r2 已绑、e1 号已死（默认跳过）→ 不进。
+  assert.deepEqual(pool.unbound.map((u) => [u.key, u.verdict]), [["h1", "clean"], ["r1", "routed"]], "未绑的健康号也要进池")
 
-  // 再扫一次：已绑过的号**不重复扫**（activation 缓存命中就跳过）
-  const before = f.getActivation().length
+  // 再汇总一次：结果稳定、仍旧零上游
+  const before = f.calls.length
   const again = await f.call("POST", "/api/invite/pool/scan", {})
-  await waitJob(f, "/api/invite/pool/scan", again.body.jobId)
-  const tokens = f.getActivation().slice(before).map((c) => c.token)
-  assert.ok(!tokens.includes(f.tokenOf("r2")), "已绑过的号不该再查 activation（缓存复活）")
+  const job = await waitJob(f, "/api/invite/pool/scan", again.body.jobId)
+  assert.deepEqual(f.readJson(POOL_FILE).unbound.map((u) => u.key), ["h1", "r1"])
+  assert.deepEqual(job.warnings, [], "数据齐全时不该有 warnings")
+  assert.equal(f.calls.length, before, "重复汇总也是零上游")
 })
 
 // ── ③ 池的算术 ──────────────────────────────────────────────────────────
 
 test("④ maxUses: 0 是**不限次数**，不会被算成 0 剩余", async (t) => {
-  const f = await fixture(t, {
-    verdicts: { h1: "clean" },
-    codes: { h1: [{ inviteCode: "INF999", usedCount: 99, maxUses: 0, status: "active" }] },
-  })
+  const f = await fixture(t, { verdicts: { h1: "clean" } })
+  seedInviteCache(f, { h1: { codes: [{ code: "INF999", usedCount: 99, maxUses: 0, status: "active" }], activation: { activated: true } } })
   const started = await f.call("POST", "/api/invite/pool/scan", {})
   await waitJob(f, "/api/invite/pool/scan", started.body.jobId)
   const pool = f.readJson(POOL_FILE)
@@ -238,14 +253,15 @@ test("④ maxUses: 0 是**不限次数**，不会被算成 0 剩余", async (t) 
 })
 
 test("⑤ status:'exhausted' 的码不计入池；left = maxUses - usedCount", async (t) => {
-  const f = await fixture(t, {
-    verdicts: { h1: "clean" },
-    codes: {
-      h1: [
-        { inviteCode: "OLD111", usedCount: 6, maxUses: 6, status: "exhausted" },
-        { inviteCode: "MIS222", usedCount: 6, maxUses: 6, status: "active" },
-        { inviteCode: "MID333", usedCount: 2, maxUses: 6, status: "active" },
+  const f = await fixture(t, { verdicts: { h1: "clean" } })
+  seedInviteCache(f, {
+    h1: {
+      codes: [
+        { code: "OLD111", usedCount: 6, maxUses: 6, status: "exhausted" },
+        { code: "MIS222", usedCount: 6, maxUses: 6, status: "active" },
+        { code: "MID333", usedCount: 2, maxUses: 6, status: "active" },
       ],
+      activation: { activated: true },
     },
   })
   const started = await f.call("POST", "/api/invite/pool/scan", {})

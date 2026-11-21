@@ -67,29 +67,29 @@
     </section>
     <section class="pane" id="pane-assign" role="tabpanel" aria-labelledby="tab-assign" hidden>
       <div class="card">
-        <div class="section-heading"><div><h2>邀请码分配</h2><p>把健康账号的邀请码，分给还没绑过邀请码的账号。打开页面只读缓存，不碰上游。</p></div><span class="section-tag">INVITE POOL</span></div>
+        <div class="section-heading"><div><h2>邀请码分配</h2><p>把健康账号的邀请码，分给还没绑过邀请码的账号。打开页面与「汇总」都只读本地缓存，不碰上游。</p></div><span class="section-tag">INVITE POOL</span></div>
         <div class="stats assign-stats" aria-label="邀请码池概览">
           <div class="stat"><span>可用码池</span><strong id="stat-assign-pool">—</strong><small>健康账号还剩多少次可绑</small></div>
           <div class="stat"><span>未绑账号</span><strong id="stat-assign-unbound">—</strong><small>还没绑定邀请码的号</small></div>
           <div class="stat"><span>可配对</span><strong id="stat-assign-pairs">—</strong><small>min(码池, 未绑)</small></div>
         </div>
         <div class="toolbar">
-          <button class="primary" id="assign-scan">扫描码池</button>
-          <span id="assign-scan-hint" class="muted" role="status">点这里才会请求上游（只取健康号的码）</span>
+          <button class="primary" id="assign-scan">汇总</button>
+          <span id="assign-scan-hint" class="muted" role="status">全部读自「邀请」页缓存，零上游请求</span>
           <button id="assign-run">开始分配</button>
           <button id="assign-stop" disabled>停止</button>
           <span id="assign-hint" class="muted" role="status"></span>
         </div>
         <p class="hint" id="assign-warn">「开始分配」会向未绑账号逐个发起绑定请求（每个号 1 次，绑定后不可撤销）；先干跑看清楚要配多少对。</p>
-        <span id="assign-at" class="muted" role="status">还没扫描过</span>
+        <span id="assign-at" class="muted" role="status">还没汇总过</span>
       </div>
       <div class="card">
         <h2 class="section-title">可用码池 <span id="assign-codes-summary" class="section-count"></span></h2>
-        <div id="assign-codes" class="table-wrap"><div class="empty">还没有扫描过：点上面的「扫描码池」</div></div>
+        <div id="assign-codes" class="table-wrap"><div class="empty">还没有汇总过：点上面的「汇总」</div></div>
       </div>
       <div class="card">
         <h2 class="section-title">未绑账号 <span id="assign-unbound-summary" class="section-count"></span></h2>
-        <div id="assign-unbound" class="table-wrap"><div class="empty">还没有扫描过</div></div>
+        <div id="assign-unbound" class="table-wrap"><div class="empty">还没有汇总过</div></div>
       </div>
     </section>
     <section class="pane" id="pane-logs" role="tabpanel" aria-labelledby="tab-logs" hidden>
