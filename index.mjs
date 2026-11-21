@@ -202,8 +202,10 @@ export const LoomyAuthPlugin = async (input = {}, options = {}) => {
     // `client.auth.set` 自己落盘（宿主一次登录只保存一个账号）。
     methods: makeMethods({ baseUrl, log, configDir, client: input?.client }),
     loader: makeLoaderHook({ configDir, log, bodyMode }),
-    // `auth.usage` 保持原样：先打积分网关、失败才回落本机缓存（用户明确要求「不要改」）。
-    usage: makeUsageHook({ baseUrl, log, configDir }),
+    // `auth.usage` **零上游**（T-54）：只读 `<configDir>/loomy-usage-cache.json`。
+    // 额度更新只能由面板的「刷新额度」按钮触发（`POST /api/usage/refresh`）。
+    // 曾经这里是「每个账号打一次积分网关」，301 个号全挤在启动瞬间 ⇒ 上游风控掉号。
+    usage: makeUsageHook({ configDir, log }),
     // 界面开关（真源与破损方式见 `AUTH_OPTIONS` 的注释）。
     // **必须**挂在 `auth` 上：`optionsOf(a.auth)`，挂顶层等于没写。
     options: AUTH_OPTIONS.map((o) => ({ ...o })),

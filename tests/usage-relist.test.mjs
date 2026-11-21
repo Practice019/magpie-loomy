@@ -141,14 +141,19 @@ test("expired → clean（重登后恢复）：带一次 kept，随后不再带"
   assert.equal(third.signIn, undefined)
 })
 
-test("verdict 无变化 + 没有状态文件：不加 signIn、不加窗口", async () => {
+test("verdict 无变化 + 没有状态文件：不加 signIn、不加判定窗", async () => {
   const store = liveStore({})
   const call = makeSession({ store })
 
   for (let i = 0; i < 3; i += 1) {
     const u = await call()
     assert.equal(u.signIn, undefined)
-    assert.equal(u.windows.length, 3, "没有判定就不该多窗口")
+    // ⚠ T-54：额度来自缓存文件，`configDir` 里没有缓存 ⇒ 只剩「额度未读」一条。
+    //    这里要钉的是「没有判定就**不许**加判定窗」，不是窗口总数。
+    assert.ok(
+      (u.windows ?? []).every((w) => w.aside === true && !String(w.name).startsWith("停用 · ")),
+      `没有判定就不该多判定窗口：${JSON.stringify(u.windows)}`,
+    )
   }
 })
 

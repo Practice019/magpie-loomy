@@ -19,7 +19,7 @@ const state = { accounts: [], tasks: new Map(), invites: new Map(), route: new M
   // 一次批量检测的状态机：idle → running → (finished | stopped)
   batch: { jobId: "", running: false, finished: false, total: 0, done: 0, okCount: 0, failCount: 0, skipped: new Set(), failed: [], stopped: "" },
   // 三个刷新任务（余额 / 任务 / 邀请）：共用服务端并发槽
-  jobs: { balance: null, tasks: null, invite: null },
+  jobs: { balance: null, usage: null, tasks: null, invite: null },
   // 余额缓存的时间戳（服务端 updatedAt）
   cacheAt: 0,
   // 路由状态的时间戳（服务端 /api/route-state 的 fetchedAt）
@@ -501,20 +501,22 @@ async function applyJudgement() {
 //      `查询余额(选中)` / `查询任务(选中)` / `刷新邀请码` / `刷新路由状态`，
 //    外加单行 `查余额` / `检测`。
 const JOB_POLL_MS = 2000
-const JOB_LABEL = { balance: "余额", tasks: "任务", invite: "邀请" }
+const JOB_LABEL = { balance: "余额", usage: "额度", tasks: "任务", invite: "邀请" }
 const JOB_PATH = {
   balance: "/api/accounts-refresh-batch",
+  // 额度：`auth.usage` 唯一的**写入口**（T-54）。不点这里，卡片永远只显示上次读数。
+  usage: "/api/usage/refresh",
   tasks: "/api/tasks-refresh-batch",
   invite: "/api/invite-refresh-batch",
 }
-const jobTimers = { balance: 0, tasks: 0, invite: 0 }
+const jobTimers = { balance: 0, usage: 0, tasks: 0, invite: 0 }
 
 function jobRunning() {
   return Object.values(state.jobs).some((job) => job?.running)
 }
 
 function refreshProgressText() {
-  const parts = ["balance", "tasks", "invite"]
+  const parts = ["balance", "usage", "tasks", "invite"]
     .map((kind) => {
       const job = state.jobs[kind]
       if (!job) return ""
@@ -590,7 +592,8 @@ async function pollJob(kind) {
   //    这次真失败的才报错（T-49 P1：旧错误不当成本次失败，但真失败也不吞）。
   const failed = Number(state.jobs[kind].failCount) || 0
   try {
-    if (kind === "balance") await balances()
+    // 额度与余额是同一次上游读数（服务端一起写两份缓存），刷新后都读回面板
+    if (kind === "balance" || kind === "usage") await balances()
     else if (kind === "tasks") await tasks(undefined, { strict: failed > 0 })
     else await invites(undefined, { strict: failed > 0 })
   } catch (e) {
@@ -689,7 +692,7 @@ function render() {
   $$("[data-route-check]").forEach((b) => { b.disabled = state.busy || state.batch.running })
   // 刷新任务进行中：刷新入口一律禁用（避免重复触发、重复扣积分）
   const running = state.batch.running || jobRunning()
-  $$("#account-balance, #account-tasks, #invite-refresh").forEach((b) => { b.disabled = state.busy || running })
+  $$("#account-balance, #account-tasks, #invite-refresh, #usage-refresh").forEach((b) => { b.disabled = state.busy || running })
   renderBatch()
   renderJobs()
 }
@@ -929,6 +932,21 @@ $("#invite-refresh").addEventListener("click", () => busy(async () => {
   await startJob("invite", uids.length ? uids : undefined)
   log("邀请码", uids.length ? `开始刷新 ${uids.length} 个账号的邀请码` : "开始刷新全部账号的邀请码")
 }, "邀请码"))
+// 额度：`auth.usage` 唯一的写入入口（T-54）。
+//
+// ⚠ 用户原话：「打开页面不许自动打上游」。所以这里**只有** click 一个入口，
+//    模块加载时不发任何请求（`tests/usage-panel.test.mjs` 用 fetch 计数钉死）。
+// ⚠ 必须**先勾选**：没勾就提示，不替用户「刷新全部 300 个号」——
+//    那正是他要关掉的那件事。
+$("#usage-refresh").addEventListener("click", () => busy(async () => {
+  const uids = [...state.selected]
+  if (!uids.length) {
+    toast("请先勾选要刷新额度的账号（不会替你刷新全部）", true)
+    return
+  }
+  const started = await startJob("usage", uids)
+  log("额度", `开始刷新 ${started.total} 个账号的额度（每个号 1 次请求，间隔/并发取设置）`)
+}, "额度"))
 // 只读：把已落盘的路由结论拉回来（不触发探测、不花积分）
 $("#route-refresh").addEventListener("click", () => busy(async () => {
   await routeStates()

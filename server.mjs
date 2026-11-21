@@ -53,6 +53,8 @@ import {
 } from "./src/points.mjs"
 import { readLocalAuth, readLocalPoints, defaultClientStoreDir } from "./src/client-store.mjs"
 import { usageFromPoints, tasksSummary, DAILY_RESET_AMOUNT } from "./src/usage.mjs"
+import { USAGE_CACHE_FILE, usageCacheEntry } from "./src/quota-cache.mjs"
+import { makeRateGate, RATE_GATE_CAPACITY, RATE_GATE_REFILL_MS } from "./src/rate-gate.mjs"
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 
@@ -121,6 +123,13 @@ export async function startServer(opts = {}) {
     slotWaiters: [],
     slotLimit: 0,
     refreshGateFn: null,
+    // 进程级令牌桶（T-54）：**任何**上游调用都要先过闸。容量跟着设置走
+    // （`balanceConcurrency`，默认 20）——它不是并发上限，是「防意外爆发」。
+    // ⚠ 放在 ctx 上而不是模块级单例：同一进程里可能起多个面板实例（测试夹具、
+    //   多端口），单例会互相串味；生产里一个进程通常只有一个实例，
+    //   效果与「进程级」等价。
+    rateGate: null,
+    rateGateCapacity: 0,
     // 判定 → 生效（`magpie plugin list`）：spawn 可注入，便于测试与排障
     spawnImpl: opts.spawnImpl ?? spawn,
     // 应用判定的超时（毫秒）；测试可注入更小的值
@@ -275,6 +284,8 @@ async function handle(req, res, ctx) {
       uptimeMs: Math.round(process.uptime() * 1000),
       pid: process.pid,
       startedAt: ctx.startedAt,
+      // 令牌桶可观测（T-54）：排障时一眼看出「是闸在排队，还是上游本身慢」
+      gate: rateGateFor(ctx).snapshot(),
     })
   }
   if (path === "/api/settings" && req.method === "GET") return getPanelSettings(res, ctx)
@@ -297,6 +308,9 @@ async function handle(req, res, ctx) {
   if (path === "/api/accounts-refresh" && req.method === "POST") return accountRefreshOne(req, res, ctx)
   if (path === "/api/accounts-refresh-batch" && req.method === "POST") return accountsRefreshStart(req, res, ctx)
   if (path === "/api/accounts-refresh-batch" && req.method === "GET") return accountsRefreshState(res, ctx, url.searchParams)
+  // 额度：`auth.usage` 唯一的**写入口**（用户在面板点「刷新额度」才走这里）
+  if (path === "/api/usage/refresh" && req.method === "POST") return usageRefreshStart(req, res, ctx)
+  if (path === "/api/usage/refresh" && req.method === "GET") return readRefreshJob(res, ctx, url.searchParams, "usage")
   // 任务 / 邀请码同理（打开面板读缓存，刷新必须用户点）
   if (path === "/api/tasks-refresh-batch" && req.method === "POST") return tasksRefreshStart(req, res, ctx)
   if (path === "/api/tasks-refresh-batch" && req.method === "GET") return tasksRefreshState(res, ctx, url.searchParams)
@@ -1132,6 +1146,8 @@ async function runRouteBatch(ctx, mods, job, uids, concurrency) {
       if (index >= uids.length) return
       const uid = uids[index]
       await gate()
+      // T-54：探测也是真实上游调用 —— 同样要过进程级令牌桶
+      await passRateGate(ctx)
       // 放闸后再确认一次：同一批的另一个 worker 可能刚刚触发熔断
       if (job.stopped) return
       // 每个号的结果在**完成时**一次性写入 ⇒ 进行中的号不会出现在 results 里
@@ -1378,11 +1394,65 @@ export function readInviteCache(configDir) {
 }
 
 /**
+ * 进程级令牌桶：容量**跟着设置走**，不写死任何上限。
+ *
+ * # 三条纪律（用户明确要求）
+ *
+ *	① 容量至少是 `RATE_GATE_CAPACITY`（20，与「余额刷新并发」的常态量级一致），
+ *	   并且**不低于**用户任何一种并发设置。用户调到 60，闸就是 60；
+ *	   **绝不**在代码里写死 3 / 6 之类「替用户限速」的数字。
+ *	② `refillMs` 只管「突发之后补多快」，同样不影响用户设定的并发。
+ *	③ 它是**防意外爆发**的闸（比如某条新代码路径在循环里连打 300 次），
+ *	   不是给正常用量设上限 —— 所以容量必须 ≥ 用户能配出来的并发。
+ *
+ * ⚠ 为什么取「各并发里的最大值」而不是 `balanceConcurrency` 一个：
+ *   路由批量走 `routeConcurrency`、任务走 `tasksConcurrency`。只看余额那个键，
+ *   用户把路由并发调到 16 时就会被闸悄悄截断 —— 那正是「偷偷加了个上限」。
+ *
+ * @param {any} ctx
+ * @returns {ReturnType<typeof makeRateGate>}
+ */
+function rateGateFor(ctx) {
+  const settings = readPanelSettings(ctx.configDir).data
+  const capacity = Math.max(
+    RATE_GATE_CAPACITY,
+    concurrencyFor("route", settings),
+    concurrencyFor("balance", settings),
+    concurrencyFor("usage", settings),
+    concurrencyFor("tasks", settings),
+    concurrencyFor("invite", settings),
+  )
+  if (!ctx.rateGate || ctx.rateGateCapacity !== capacity) {
+    ctx.rateGate = makeRateGate({ capacity, refillMs: RATE_GATE_REFILL_MS })
+    ctx.rateGateCapacity = capacity
+  }
+  return ctx.rateGate
+}
+
+/**
+ * 过闸：拿不到令牌就排队等。
+ *
+ * ⚠ 必须在**真正发请求之前**调用，且**不要**把它当成并发上限来用 —— 并发由
+ *   设置里的各类 concurrency 决定，闸只负责把「意外的爆发」摊平。
+ *
+ * @param {any} ctx
+ * @returns {Promise<void>}
+ */
+function passRateGate(ctx) {
+  return rateGateFor(ctx).acquire()
+}
+
+/**
  * 进程级并发槽：所有刷新任务共享 `ctx.slotLimit`。
  *
  * 三个全量任务同时启动时，总并发不会超过设置值（而不是 3 × 设置值）。
+ *
+ * ⚠ T-54：**过槽之前先过闸**。这里是所有刷新类上游调用的唯一咽喉
+ *   （余额 / 额度 / 任务 / 邀请码 / 邀请码池补拉 / 分配），把闸放在这里
+ *   就不会漏掉任何一条未来的新路径。
  */
 async function withSlot(ctx, fn) {
+  await passRateGate(ctx)
   const limit = Math.max(1, Number(ctx.slotLimit) || ROUTE_BATCH_CONCURRENCY)
   if (ctx.slotActive < limit) {
     ctx.slotActive += 1
@@ -1536,6 +1606,100 @@ async function refreshOneAccount(ctx, uid) {
     } catch {}
     return { error: error || "查询失败" }
   }
+}
+
+/**
+ * 查一个号的额度并**写进两处缓存**：`loomy-usage-cache.json`（`auth.usage` 读它）
+ * 与 `loomy-accounts-cache.json`（面板「积分」列读它）。
+ *
+ * # 为什么两处都写
+ *
+ * 这是一次真实上游读数的**唯一时刻**。分成两条独立链路（各写一份）只会让
+ * 「面板显示 100、卡片显示 120」这种自相矛盾出现。同一次读数写两处，
+ * 两边永远一致 —— 而且都**不再二次请求**。
+ *
+ * ⚠ 失败时**保留旧额度**，只写 `error`：一次网络抖动不该把用户已有的读数抹掉。
+ *
+ * @param {any} ctx
+ * @param {string} uid
+ * @returns {Promise<{at: number, windows: number, plan: string}|{error: string}>}
+ */
+async function refreshUsageOne(ctx, uid) {
+  const prior = readUsageCacheTable(ctx.configDir).accounts[uid]
+  /** @type {string} */
+  let session = ""
+  try {
+    const account = readMagpieAuth(ctx.configDir).find((a) => String(a.uid) === String(uid))
+    if (!account) throw new Error("找不到这个账号的 session")
+    session = account.session
+
+    // ⚠ 这是**整个插件里唯一**因为额度而打上游的地方（用户点了按钮才走到这里）
+    const pts = await fetchPointsSnapshot({ baseUrl: ctx.baseUrl, auth: { session }, fetchImpl: ctx.fetchImpl })
+    const { windows } = usageFromPoints(pts)
+    const entry = usageCacheEntry({
+      windows,
+      permanent: pts.permanentKnown ? Number(pts.permanent) || 0 : 0,
+      plan: String(/** @type {any} */ (pts)?.plan ?? ""),
+      limited: false,
+      at: Date.now(),
+    })
+
+    // ① `auth.usage` 的数据源
+    writeKeyedCache(ctx.configDir, USAGE_CACHE_FILE, "accounts", uid, entry)
+    // ② 面板「积分」列的数据源（同一次读数，不重复请求）
+    writeKeyedCache(ctx.configDir, ACCOUNTS_CACHE_FILE, "accounts", uid, {
+      balance: Number(pts.available) || 0,
+      daily: pts.dailyKnown ? Number(pts.daily) || 0 : 0,
+      permanent: pts.permanentKnown ? Number(pts.permanent) || 0 : 0,
+      dailyLimit: DAILY_RESET_AMOUNT,
+      at: entry.at,
+      error: "",
+    })
+
+    return { at: entry.at, windows: windows.length, plan: entry.plan }
+  } catch (e) {
+    const error = sanitizeError(e, session)
+    // 失败也要留痕（面板要显示「上次查询失败」），但**旧额度不删**
+    try {
+      const accountsPrior = readAccountsCache(ctx.configDir).accounts[uid]
+      writeKeyedCache(ctx.configDir, ACCOUNTS_CACHE_FILE, "accounts", uid, { ...(isPlainObject(accountsPrior) ? accountsPrior : {}), error })
+    } catch {}
+    // 额度缓存只在「本来就没读过」时写一条占位（有旧读数就原样留着）
+    if (!isPlainObject(prior)) {
+      try {
+        writeKeyedCache(ctx.configDir, USAGE_CACHE_FILE, "accounts", uid, usageCacheEntry({ windows: [], at: Date.now() }))
+      } catch {}
+    }
+    return { error }
+  }
+}
+
+/**
+ * `POST /api/usage/refresh {uids?, concurrency?}` → 立刻回 jobId。
+ *
+ * # 这是额度**唯一的写入入口**
+ *
+ * `auth.usage` 现在只读缓存、零上游（见 `src/hooks/usage.mjs`）。所以用户想看到
+ * 最新额度，只能点面板的「刷新额度」按钮 → 走这里。
+ *
+ * 参数沿用 `startListRefresh` 那一套（同一份校验、同一套并发设置、同一套
+ * 节流与熔断）：
+ *
+ *	uids         省略 = 全部账号；「只刷选中的账号」就是传面板勾选出来的 uid 列表
+ *	concurrency  省略 = 设置里的 `balanceConcurrency`（默认 20，**无上限**）
+ *
+ * 保护（用户可调，代码里不写死上限）：
+ *	· 并发 = 设置值
+ *	· 相邻两次启动 ≥ `gapMs`（默认 300ms）
+ *	· 连续 3 个号被判风控 → **立即停止**，剩下的号一次都不打
+ */
+function usageRefreshStart(req, res, ctx) {
+  return startListRefresh(req, res, ctx, "usage", (uid) => refreshUsageOne(ctx, uid))
+}
+
+/** 读 `loomy-usage-cache.json`（与 `auth.usage` 读的是同一个文件、同一个形状）。 */
+function readUsageCacheTable(configDir) {
+  return readKeyedCache(configDir, USAGE_CACHE_FILE, "accounts")
 }
 
 /**
@@ -2429,6 +2593,10 @@ const SETTINGS_FILE = "loomy-panel-settings.json"
 const CONCURRENCY_KEYS = Object.freeze({
   route: "routeConcurrency",
   balance: "balanceConcurrency",
+  // 额度刷新与余额刷新是**同一种**上游调用（GET /points/records），
+  // 所以共用 `balanceConcurrency`（面板上就是「余额刷新并发」那个输入框）。
+  // ⚠ 不新增设置项：用户已经能在那里调，多一个键只会让人不知道该改哪个。
+  usage: "balanceConcurrency",
   tasks: "tasksConcurrency",
   invite: "inviteConcurrency",
 })

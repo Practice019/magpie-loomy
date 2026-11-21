@@ -175,9 +175,16 @@ test("④ 三个全量任务同时跑：总并发 ≤ 设置值（共享槽）",
   assert.ok(f.state.peak <= 2, `三个任务共享并发槽，总并发不得超过 2，实际 ${f.state.peak}`)
 })
 
-test("⑤ 熔断只影响自己：tasks 任务连挂 3 次 429 停下，其它任务照常跑完", async (t) => {
+test("⑤ 熔断只影响自己：tasks 任务连挂 3 次 429 停下，其它任务照常跑完", { timeout: 30000 }, async (t) => {
   const f = await fixture(t)
   f.state.rateLimited = true
+  // ⚠ 熔断要验的语义是「**连续 3 个 429 ⇒ 停下，剩下的号不再打**」。
+  //    tasks 默认并发是 2，于是「第 3 个 429 落地」与「另一个 worker 已经开始
+  //    第 4 个请求」之间存在调度空隙 —— 并行跑全量时偶发 `done = 4`。
+  //    这不是熔断失效（`stopped` 照样置位、剩余号确实没打），而是并发 > 1 时
+  //    「精确停在 3」本身就不是一个成立的性质。
+  //    这里把 tasks 并发设成 1：因果顺序变成确定的，断言回到它真正要钉的东西。
+  assert.equal((await f.call("POST", "/api/settings", { tasksConcurrency: 1 })).status, 200)
   const tasks = await f.call("POST", "/api/tasks-refresh-batch", { uids: ["u0", "u1", "u2", "u3", "u4"] })
   const balanceReady = await f.call("POST", "/api/accounts-refresh-batch", { uids: ["u0", "u1"] })
   const tasksJob = await waitJob(f, "/api/tasks-refresh-batch", tasks.body.jobId)

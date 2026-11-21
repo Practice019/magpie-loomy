@@ -5,8 +5,9 @@
 //	1. **`auth.refresh` 不存在**（不是空壳）：本上游没有 refresh token，session
 //	   也不会过期（见 `src/credential.mjs`）。造一个空 refresh 会让 magpie 以为
 //	   「能自动恢复」，从而把换号重试当成有效处置。
-//	2. **`auth.usage` 真的打上游**：先积分网关 `/points/records`，失败才回落本机
-//	   缓存。用户明确要求「usage 这些也不要改」，所以这里断言它**会**发请求。
+//	2. **`auth.usage` 零上游**：它只读 `<configDir>/loomy-usage-cache.json`。
+//	   T-54 之前这里是「每个账号打一次 `/points/records`」—— 301 个号全挤在启动
+//	   瞬间，上游风控直接成批掉号（用户原话：「一定不可以这样」）。
 //	3. **`auth.models` 的缓存不再按账号打上游**：301 个号并发只 1 次请求
 //	   （`tests/models-cache.test.mjs` 有完整版，这里用入口钩子再钉一遍）。
 
@@ -34,7 +35,7 @@ test("`auth.refresh` / `auth.checkin` 不存在（typeof === \"undefined\"）", 
   assert.ok(!("refresh" in p.auth), "连键都不该有（空壳会自动恢复误判）")
 })
 
-test("`auth.usage` 会真实打上游（积分网关 ≥1 次请求）", async (t) => {
+test("`auth.usage` **零上游**：连调 301 次一个请求都不发（T-54 核心回归）", async (t) => {
   const dir = tempDir(t)
   /** @type {string[]} */
   const urls = []
@@ -48,12 +49,21 @@ test("`auth.usage` 会真实打上游（积分网关 ≥1 次请求）", async (
   })
 
   const p = await LoomyAuthPlugin({ directory: dir }, {})
-  const usage = await p.auth.usage(async () => ({ type: "oauth", access: SESSION, uid: UID }))
+  /** @type {any} */
+  let last
+  for (let i = 0; i < 301; i += 1) {
+    last = await p.auth.usage(async () => ({ type: "oauth", access: String(i).padStart(32, "0"), uid: `acc-${i}` }))
+  }
 
-  assert.ok(urls.length >= 1, `auth.usage 必须至少打一次上游，实际 ${urls.length}`)
-  assert.ok(urls.some((u) => u.includes("/points/records")), `应当走积分网关，实际: ${urls.join(" | ")}`)
-  assert.ok(Array.isArray(usage.windows) && usage.windows.length > 0, "额度窗口要真的算出来")
-  assert.equal(usage.error, undefined, "有数据时不许塞 error（那会整块替换额度区）")
+  // ⚠ 这正是用户在 `app.log` 里数出来的那 301 次 `GET /points/records`。
+  //    它曾经全挤在启动瞬间 ⇒ 上游风控 ⇒ 成批掉号。现在必须是 0。
+  assert.deepEqual(urls, [], `auth.usage 不许打上游，实际: ${urls.join(" | ")}`)
+  assert.equal(last.error, undefined, "「还没读过」不是错误（error 会整块替换额度区）")
+  assert.ok(Array.isArray(last.windows) && last.windows.length > 0, "仍要给出一条「额度未读」说明")
+  assert.ok(
+    last.windows.some((w) => String(w.name).startsWith("说明 · ") && w.aside === true),
+    `应当是「说明 · 额度未读」，实际: ${JSON.stringify(last.windows)}`,
+  )
 })
 
 test("`provider.models` 走文件缓存：同一个 baseUrl 并发 301 次只 1 次上游", async (t) => {
