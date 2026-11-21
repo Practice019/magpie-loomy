@@ -22,6 +22,9 @@ import { chatHeaders, sessionAffinity } from "../auth-headers.mjs"
 import { buildClientBody } from "../client-body.mjs"
 import { CLIENT_BODY_TEMPLATE } from "../client-body-template.mjs"
 import { DEFAULT_LOOMY_VERSION, CLIENT_USER_AGENT, CLIENT_ACCEPT_ENCODING, DEFAULT_BASE_URL, DEFAULT_BODY_MODE } from "../constants.mjs"
+// 额度推算（T-57）：只用「已经存在的响应里的 points_consumed」，这里绝不发请求。
+import { readUsageCache, pointsFromUsage, USAGE_CACHE_FILE } from "../quota-cache.mjs"
+import { writeKeyedCacheFile } from "../cache-write.mjs"
 import { recordTraffic as recordTrafficDefault } from "../traffic.mjs"
 
 /** 生图端点路径片段（用来判断该不该补 token 头）。 */
@@ -535,10 +538,17 @@ export function makeLoaderHook(opts = {}) {
         // ⚠ tee 必须在宿主开始读**之前**调（本函数就在 fetch 返回前同步调用）。
         const [forHost, forPeek] = stream.tee()
 
-        void watchFirstModel(forPeek)
-          .then((served) => {
-            if (!served) return
-            return applyServedModel({ configDir, uid, requested, served, routeStore: storeOpt, log: { warn }, now })
+        // 同一个观察分支里顺便读 `usage.points_consumed`：上游只在**最后一个**
+        // usage 块里给这个数，所以要读到流结束（不能像 model 那样读到就停）。
+        // 这样「额度推算」不需要任何额外请求 —— 见 `recordConsumedPoints`。
+        void watchServedAndUsage(forPeek)
+          .then(({ served, pointsConsumed }) => {
+            if (served) {
+              void applyServedModel({ configDir, uid, requested, served, routeStore: storeOpt, log: { warn }, now }).catch(() => {})
+            }
+            if (pointsConsumed > 0) {
+              void recordConsumedPoints({ configDir, uid, points: pointsConsumed, log: { warn } }).catch(() => {})
+            }
           })
           .catch(() => {})
 
@@ -766,6 +776,18 @@ export const MODEL_PEEK_LIMIT_BYTES = 4096
 export const MODEL_PEEK_TIMEOUT_MS = 10_000
 
 /**
+ * 读 `points_consumed` 时观察分支的**总**字节上限。
+ *
+ * 与 `MODEL_PEEK_LIMIT_BYTES` 不同：`points_consumed` 在响应的**最后一块**，
+ * 所以必须读到流结束。长对话可能几十 MB —— 给一个够用又不至于爆内存的上限
+ * （32 MB）。超了就放弃这次记账（只少记一次消耗，绝不影响主流程）。
+ */
+export const USAGE_PEEK_LIMIT_BYTES = 32 << 20
+
+/** 只为解析 `points_consumed` 而保留的尾部窗口（多块 JSON 不会超它）。 */
+export const USAGE_TAIL_BYTES = 8192
+
+/**
  * 从一段 SSE 文本里取出**第一个** `data:` 的 JSON 的 `model` 字段。
  *
  * 非 JSON（`[DONE]`、心跳、空行）一律跳过。返回空串表示「这一段里还没有」。
@@ -796,6 +818,100 @@ export function extractFirstModel(text) {
     return payload
   }
   return ""
+}
+
+/**
+ * 读**整条**观察分支，同时拿到「首个 model」与「最后一个 points_consumed」。
+ *
+ * # 为什么不能像 `watchFirstModel` 那样读完 model 就停
+ *
+ * 上游把 `points_consumed` 放在**最后一个** `choices: []` 的 usage 块里
+ * （实测：流式与非流式都是），读早了根本见不到这个字段。所以这里读到流结束。
+ *
+ * # 红线
+ *
+ * 用的是 tee 出来的**第二支**（`cancel()` 只作用于它，与原流无关），
+ * 所以不会压平宿主那条流的时间轴（T-28 真机事故）。字节上限与超时仍然保留：
+ * 长对话动辄几十 MB，观察分支不能无限读 —— 超了就放弃 points（只是少记一次），
+ * 绝不影响主流程。
+ *
+ * @param {ReadableStream<Uint8Array>} stream tee 出来的观察分支
+ * @param {{limitBytes?: number, timeoutMs?: number}} [opts]
+ * @returns {Promise<{served: string, pointsConsumed: number}>}
+ */
+export async function watchServedAndUsage(stream, opts = {}) {
+  const limit = Number(opts.limitBytes) > 0 ? Number(opts.limitBytes) : USAGE_PEEK_LIMIT_BYTES
+  const timeoutMs = Number(opts.timeoutMs) > 0 ? Number(opts.timeoutMs) : MODEL_PEEK_TIMEOUT_MS
+  const none = { served: "", pointsConsumed: 0 }
+  if (!stream || typeof stream.getReader !== "function") return none
+
+  const reader = stream.getReader()
+  const decoder = new TextDecoder()
+  let served = ""
+  let pointsConsumed = 0
+  let bytes = 0
+  let tail = ""
+
+  const stop = () => {
+    try {
+      reader.cancel().catch(() => {})
+    } catch {
+      /* 观察分支的收尾失败不影响任何东西 */
+    }
+  }
+
+  let timer = 0
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve("__timeout__"), timeoutMs)
+    timer.unref?.()
+  })
+
+  try {
+    for (;;) {
+      const next = await Promise.race([reader.read(), timeout])
+      if (next === "__timeout__") {
+        stop()
+        return { served, pointsConsumed }
+      }
+      if (!next || next.done) break
+      const piece = decoder.decode(next.value ?? new Uint8Array(0), { stream: true })
+      bytes += next.value?.byteLength ?? 0
+      if (!served) served = extractFirstModel(tail + piece)
+      // 只保留尾部一段用于解析：`points_consumed` 在最后一块，整段攒会爆内存
+      tail = (tail + piece).slice(-USAGE_TAIL_BYTES)
+      const p = extractPointsConsumed(tail)
+      if (p > 0) pointsConsumed = p
+      if (bytes >= limit) break
+    }
+  } catch {
+    /* 读流异常 = 这次没证据，返回已拿到的部分 */
+  } finally {
+    clearTimeout(timer)
+    stop()
+  }
+  return { served, pointsConsumed }
+}
+
+/**
+ * 从任意一段 SSE / JSON 文本里取**最后一个** `usage.points_consumed`。
+ *
+ * 最后一块才是最终账（中途块的 usage 可能是累计过程中的值），所以取 max 不够，
+ * 要按出现顺序取最后出现的那个。
+ *
+ * @param {string} text
+ * @returns {number} 认不出返回 0
+ */
+export function extractPointsConsumed(text) {
+  const s = String(text ?? "")
+  if (!s) return 0
+  let last = 0
+  const re = /"points_consumed"\s*:\s*(\d+(?:\.\d+)?)/g
+  let m
+  while ((m = re.exec(s)) !== null) {
+    const n = Number(m[1])
+    if (Number.isFinite(n) && n >= 0) last = Math.floor(n)
+  }
+  return last
 }
 
 /**
@@ -927,6 +1043,49 @@ export function replaceResponseBody(resp, body) {
  *   routeStore?: any, log?: {warn?: Function}, now?: () => number}} opts
  * @returns {Promise<void>}
  */
+/**
+ * 把这次对话消耗的积分记到额度缓存里（累加），供「推算余额」使用。
+ *
+ * # 这是「额度不用手动刷新」的全部秘密
+ *
+ * 上游每次对话的响应都带 `usage.points_consumed`，但**从不带余额**。
+ * 所以额度 = 上次真实读数（`baseline`）− 累计消耗（`consumed`）。
+ * 这个函数只做加法，一个上游请求都不发 —— 正是用户要的「尽量不请求」。
+ *
+ * # 绝不改 `baseline`
+ *
+ * `baseline` 只由用户点「刷新额度」写入（那是唯一一次真实读数）。
+ * 这里动了它，推算就失去意义了。
+ *
+ * @param {{configDir: string, uid: string, points: number, log?: any}} opts
+ * @returns {Promise<boolean>} 真的记账了才 true（没有 baseline 时不记 —— 反正也算不出）
+ */
+export async function recordConsumedPoints(opts) {
+  const { configDir, uid } = opts
+  const points = pointsFromUsage({ points_consumed: opts.points })
+  if (!configDir || !uid || points <= 0) return false
+  try {
+    const cache = readUsageCache(configDir)
+    const entry = cache?.accounts?.[uid]
+    // 没有真实读数 ⇒ 推算无从谈起；等用户点一次「刷新额度」再开始记账
+    if (!entry || !Number.isFinite(Number(entry.baseline))) return false
+    const next = {
+      ...entry,
+      consumed: (Number(entry.consumed) || 0) + points,
+      lastConsumedAt: Date.now(),
+    }
+    writeKeyedCacheFile(configDir, USAGE_CACHE_FILE, "accounts", uid, next)
+    return true
+  } catch (e) {
+    try {
+      opts.log?.warn?.(`loomy: 记录积分消耗失败（不影响请求）: ${e?.message ?? e}`)
+    } catch {
+      /* 日志失败不是业务失败 */
+    }
+    return false
+  }
+}
+
 export async function applyServedModel(opts) {
   const { configDir, uid, requested, served } = opts
   const warn = (m) => {

@@ -59,6 +59,9 @@ export const UNREAD_NOTE = `${NOTE_PREFIX}额度未读`
 /** 「额度读于多久前」那条说明窗的**名字**（时间只进 `display`，T-37）。 */
 export const AGE_NOTE = `${NOTE_PREFIX}额度读于`
 
+/** 「这个数是推算出来的」那条说明窗的名字（接在额度窗后面）。 */
+export const PROJECTION_NOTE = `${NOTE_PREFIX}额度推算`
+
 /**
  * 读整张缓存表（缺文件 / 损坏 / 形状不对 → 空表，**绝不抛**）。
  *
@@ -171,6 +174,28 @@ export function usageFromCache(entry, opts = {}) {
     }
   }
 
+  // ── 推算：基准读数 − 累计消耗（T-57）──
+  //
+  // 上游每次对话都回 `points_consumed` 但不回余额，所以这里把**主额度窗**
+  // 的 balance 换成推算值，并在 display 里写明「推算」+ 基准时间。
+  // 这样额度列不用手动刷新也是活的，且**一个额外请求都不发**。
+  //
+  // ⚠ 只改**第一条非 aside 的额度窗**（卡片上的主额度），别动 aside 明细：
+  //   永久积分 / 受限积分那些是上游的原始读数，改了就对不上了。
+  const left = projectedBalance(entry)
+  if (left !== null) {
+    const i = windows.findIndex((w) => w && w.aside !== true && typeof w.balance === "number")
+    if (i >= 0) {
+      const note = projectionText(entry, now)
+      windows[i] = {
+        ...windows[i],
+        balance: left,
+        display: `${trimNum(left)} 积分`,
+      }
+      windows.splice(i + 1, 0, { name: PROJECTION_NOTE, aside: true, display: note })
+    }
+  }
+
   // ⚠ 说明窗追加在**末尾**：前面的额度窗顺序（每日赠送 / 永久积分 / 可用总额）
   //   是卡片上的既有布局，说明只是补一句「什么时候读的」。
   return {
@@ -187,7 +212,6 @@ export function usageFromCache(entry, opts = {}) {
 
 /**
  * 把「刚读回来的账本」整理成缓存记录（面板刷新写盘用）。
- *
  * # 为什么要存 `plan` / `permanent` / `limited`
  *
  * 它们不参与任何判断，只是让面板「额度」列在**不发请求**时也能显示套餐与
@@ -227,4 +251,82 @@ export function countableWindows(windows) {
   return (Array.isArray(windows) ? windows : []).filter(
     (w) => w && typeof w === "object" && w.aside !== true,
   )
+}
+
+// ── 消耗记账与推算（T-57）────────────────────────────────────────────────
+//
+// # 为什么需要它
+//
+// 上游每次对话的响应里都带 `usage.points_consumed`（实测：流式与流式都有），
+// 但**从不带余额**。所以余额只能：
+//
+//	基准读数（用户点「刷新额度」那一刻的真实余额）
+//	  − 之后累计的 points_consumed
+//	  = 当前推算余额
+//
+// 这样额度列不用再手动刷新，也**一个额外请求都不发**。
+//
+// # 为什么 5000 才校准
+//
+// 签到、邀请奖励这些不经过对话，推算必然慢慢偏离。但校准要打上游 ——
+// 用户要的是「请求非常非常少」，所以阈值定在 5000 积分（约等于
+// 一个号全部额度）。到了阈值只在卡片上提示「建议校准」，
+// **绝不自动发请求**（自动发请求正是之前掉号的原因）。
+
+/** 累计消耗到这个数就标记「建议校准」。用户定的 5000。 */
+export const CALIBRATE_AFTER_POINTS = 5000
+
+/** 从 `usage.points_consumed` 里取一个非负整数；认不出就 0。 */
+export function pointsFromUsage(usage) {
+  const n = Number(usage?.points_consumed)
+  if (!Number.isFinite(n) || n <= 0) return 0
+  return Math.floor(n)
+}
+
+/**
+ * 推算一个账号当前的余额：`baseline - consumed`，**下限 0**。
+ *
+ * 没有 `baseline`（从没读过真实余额）⇒ `null`，调用方继续显示「未读」。
+ *
+ * @param {{baseline?: number, consumed?: number}} entry
+ * @returns {number|null}
+ */
+export function projectedBalance(entry) {
+  const base = Number(entry?.baseline)
+  if (!Number.isFinite(base) || base < 0) return null
+  const used = Number(entry?.consumed)
+  const safeUsed = Number.isFinite(used) && used > 0 ? used : 0
+  return Math.max(0, base - safeUsed)
+}
+
+/** 推算值是否已经该校准了（累计消耗 ≥ 阈值）。 */
+export function needsCalibration(entry, threshold = CALIBRATE_AFTER_POINTS) {
+  const used = Number(entry?.consumed)
+  if (!Number.isFinite(used) || used <= 0) return false
+  return used >= threshold
+}
+
+/**
+ * 把一条「推算说明」拼成人话：`推算：基准 15:42 − 已消耗 12.5`。
+ *
+ * 刻意写「推算」两个字：这个数不是上游给的，签到/邀请变化它看不出来。
+ */
+export function projectionText(entry, now = Date.now()) {
+  const left = projectedBalance(entry)
+  if (left === null) return ""
+  const used = Number(entry?.consumed) || 0
+  const stamp = (() => {
+    const at = Number(entry?.calibratedAt ?? entry?.at)
+    if (!Number.isFinite(at) || at <= 0) return ""
+    const d = new Date(at)
+    return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`
+  })()
+  const tail = needsCalibration(entry) ? "，已超 5000，建议校准" : ""
+  return `推算：基准${stamp ? " " + stamp : ""} 读数 − 已消耗 ${trimNum(used)}${tail}`
+}
+
+/** 12.5 而不是 12.500000001：只留两位并去掉尾巴零。 */
+function trimNum(n) {
+  const v = Math.round(Number(n) * 100) / 100
+  return Number.isInteger(v) ? String(v) : String(v)
 }
