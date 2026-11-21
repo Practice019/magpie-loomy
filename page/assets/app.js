@@ -4,7 +4,16 @@ const BASE = new URL(document.currentScript.src).origin
 const state = { accounts: [], tasks: new Map(), invites: new Map(), route: new Map(), selected: new Set(), busy: false, accountPage: 1, invitePage: 1, accountSize: 50, inviteSize: 50,
   // 面板设置（服务端权威值；`batchSkipChecked` 决定批量是否跳号）
   // ⚠ `focusRefresh` 本地初值必须是 false：服务端没读到之前，切窗口一律不重读。
-  panel: { batchConcurrency: 2, balanceConcurrency: 2, batchSkipChecked: true, ledgerReads: 3, focusRefresh: false },
+  // ⚠ `synced` 只有「`GET /api/settings` 真的读成功」才置 true：首屏那一次
+  //    `syncSettingsFields()` 不许把 localStorage 里的并发缓存冲成默认值。
+  // ⚠ 设置 tab 的**每一个**控件都必须在这里有同名键，否则 syncSettingsFields()
+  //    无从回填，页面就一直显示 HTML 里写死的初值（用户报的「下次启动又回默认」）。
+  panel: {
+    routeConcurrency: 2, batchConcurrency: 2, balanceConcurrency: 2, tasksConcurrency: 2, inviteConcurrency: 2,
+    accountConcurrency: 20, bindConcurrency: 20,
+    gapMs: 300, autoApply: true, magpiePath: "",
+    batchSkipChecked: true, ledgerReads: 3, focusRefresh: false, synced: false,
+  },
   // 上次已经打过「服务启动于 …」的那个 `since`（同一个进程只打一次，重启才再打）
   serviceLoggedSince: 0,
   // 一次批量检测的状态机：idle → running → (finished | stopped)
@@ -163,10 +172,10 @@ function clock(at) {
  * 积分列：**只显示缓存**。
  *
  * 面板不再自动查余额 —— `a.cached === false` 时显示灰色的「未查询」，
- * 用户点「刷新全部 / 查询余额(选中) / 查余额」才会有数据。
+ * 用户点「查询余额(选中) / 查余额」才会有数据。
  */
 function quota(a) {
-  if (a.cached !== true || !a.quota) return '<span class="muted" title="还没查询过；点「刷新全部」获取余额">未查询</span>'
+  if (a.cached !== true || !a.quota) return '<span class="muted" title="还没查询过；选中后点「查询余额(选中)」获取">未查询</span>'
   const windows = a.quota?.windows ?? []
   // ⚠ 窗口名带类型前缀（T-31：`额度 · 每日赠送` / `说明 · 永久积分` / `说明 · 可用总额`），
   //   但**旧缓存**里的名字没有前缀。所以比对前先剥掉前缀 —— 否则升级后的第一次渲染
@@ -486,10 +495,11 @@ async function applyJudgement() {
 // ── 刷新任务：打开面板只读缓存，刷新必须用户点 ──────────────────────────
 //
 // 打开面板**绝不**自动查余额/任务/邀请码（184 个号全量打上游 = 限流 = 成批失败）。
-// 三个数据源共用一套任务形状与一套全局并发槽（总并发 ≤ 设置值，而不是 3×设置）：
-//   `刷新全部（余额·任务·邀请）` 依次启动三个 job
-//   `查询余额(选中)` / `查询任务(选中)` 只跑勾选的号
-//   单行 `查余额` 也进同一个队列（狂点不会把上游打限流）
+// 三个数据源共用一套任务形状与一套全局并发槽（总并发 ≤ 设置值，而不是 3×设置）。
+// ⚠ T-49：「刷新全部（余额·任务·邀请）」按钮**已删除**（危险：一下点就把三个队列
+//    全量打上游）。刷新入口只剩用户主动点的独立按钮：
+//      `查询余额(选中)` / `查询任务(选中)` / `刷新邀请码` / `刷新路由状态`，
+//    外加单行 `查余额` / `检测`。
 const JOB_POLL_MS = 2000
 const JOB_LABEL = { balance: "余额", tasks: "任务", invite: "邀请" }
 const JOB_PATH = {
@@ -522,11 +532,11 @@ function renderJobs() {
   if (note) {
     const at = Number(state.cacheAt) || 0
     if (!at) {
-      note.textContent = "还没有余额数据：点「刷新全部」获取（会调用 184 次，请勿频繁操作）"
+      note.textContent = "还没有余额数据：勾选账号后点「查询余额(选中)」获取（每个号一次调用，请勿频繁操作）"
       note.className = "muted"
     } else {
       const stale = Date.now() - at > 24 * 3600 * 1000
-      note.textContent = `数据截至 ${clock(at)}${stale ? "（较旧，点刷新全部更新）" : ""}`
+      note.textContent = `数据截至 ${clock(at)}${stale ? "（较旧，点「查询余额(选中)」更新）" : ""}`
       note.className = stale ? "muted" : ""
     }
   }
@@ -575,12 +585,18 @@ async function pollJob(kind) {
     return
   }
   clearTimeout(jobTimers[kind])
-  // 结束后只**读缓存**回填（不再发上游）
+  // 结束后只**读缓存**回填（不再发上游）。
+  // ⚠ `strict` 只在「本次刷新确实报了失败」时打开：缓存里的历史 error 不抛，
+  //    这次真失败的才报错（T-49 P1：旧错误不当成本次失败，但真失败也不吞）。
+  const failed = Number(state.jobs[kind].failCount) || 0
   try {
     if (kind === "balance") await balances()
-    else if (kind === "tasks") await tasks()
-    else await invites()
-  } catch {}
+    else if (kind === "tasks") await tasks(undefined, { strict: failed > 0 })
+    else await invites(undefined, { strict: failed > 0 })
+  } catch (e) {
+    log(JOB_LABEL[kind], `失败：${e.message}`)
+    toast(`${JOB_LABEL[kind]}刷新失败：${e.message}`, true)
+  }
   log(JOB_LABEL[kind], state.jobs[kind].stopped
     ? `刷新被熔断停止：${state.jobs[kind].done}/${state.jobs[kind].total}（上游限流，剩余账号未调用）`
     : `刷新完成：成功 ${state.jobs[kind].okCount}，失败 ${state.jobs[kind].failCount}`)
@@ -666,14 +682,14 @@ function renderInvite() {
 function render() {
   renderAccounts()
   renderInvite()
-  $$("button[data-account-action], [data-row-action], [data-route-check], [data-bind-uid], #bind-run, #bind-clear, #refresh, #invite-refresh, #route-refresh").forEach((b) => { b.disabled = state.busy })
+  $$("button[data-account-action], [data-row-action], [data-route-check], [data-bind-uid], #bind-run, #bind-clear, #invite-refresh, #route-refresh").forEach((b) => { b.disabled = state.busy })
   $$("[data-select], #select-all, #bind-codes, #bind-count, #bind-conc, input[name=bindMode]").forEach((b) => { b.disabled = state.busy })
   $$("[data-account-action]").forEach((b) => { b.disabled = state.busy || state.selected.size === 0 })
   // 批量检测跑着的时候，单行「检测」也禁用（每个号都真扣积分，不许重复点）
   $$("[data-route-check]").forEach((b) => { b.disabled = state.busy || state.batch.running })
   // 刷新任务进行中：刷新入口一律禁用（避免重复触发、重复扣积分）
   const running = state.batch.running || jobRunning()
-  $$("#refresh, #account-balance, #account-tasks, #invite-refresh").forEach((b) => { b.disabled = state.busy || running })
+  $$("#account-balance, #account-tasks, #invite-refresh").forEach((b) => { b.disabled = state.busy || running })
   renderBatch()
   renderJobs()
 }
@@ -694,17 +710,28 @@ async function balances(uids) {
   }
   // 查询失败是「缓存里的上次失败」，不再当成页面级错误（缓存数据仍然有效）
 }
-async function tasks(uids) {
+async function tasks(uids, { strict = false } = {}) {
   const result = await api("/api/tasks" + query(uids))
   if (!uids) state.tasks.clear()
   for (const row of result.rows ?? []) state.tasks.set(row.uid, row)
-  if ((result.rows ?? []).some((row) => row.error)) throw new Error("任务查询部分失败，失败账号显示未知，请稍后刷新。")
+  // ⚠ 缓存里的 `error` 是**上次真实查询**留下的原文，不是本次请求的失败：
+  //    默认不抛（只留在行内）；`strict` 仅用于「本次真的发起了刷新」的路径。
+  if (strict) {
+    const failed = (result.rows ?? []).filter((row) => row.error)
+    if (failed.length) throw new Error(`本次刷新有 ${failed.length} 个账号未成功（原因见表格行内）`)
+  }
 }
-async function invites(uids) {
+async function invites(uids, { strict = false } = {}) {
   const result = await api("/api/invite" + query(uids))
   if (!uids) state.invites.clear()
   for (const row of result.rows ?? []) state.invites.set(row.uid, row)
-  if ((result.rows ?? []).some((row) => row.error)) throw new Error("邀请码查询部分失败，已保留可用结果；请查看表格错误。")
+  // ⚠ 打开页面走的就是这里，而它**一个上游请求都不发**：
+  //    所以行内 `error` 必然是历史值（server.mjs 从 invite-cache.json 原样带回）。
+  //    默认不抛，只进表格行内；只有本次真发起了刷新（strict）才算失败。
+  if (strict) {
+    const failed = (result.rows ?? []).filter((row) => row.error)
+    if (failed.length) throw new Error(`本次刷新有 ${failed.length} 个账号未成功（原因见表格行内）`)
+  }
 }
 
 async function queries(work) {
@@ -745,30 +772,21 @@ async function busy(work, source = "面板") {
   }
 }
 
-/**
- * 「刷新全部（余额·任务·邀请）」= 唯一会全量打上游的入口（用户点才有）。
- *
- * 依次启动三个 job（不是并行开三个队列）：服务端三个任务共享同一个并发槽
- * 与 300ms 启动节流，所以总并发仍是设置值（不会变成 3×设置）。
- * 进度由各自的 `pollJob` 轮询，不阻塞这里的 busy()。
- */
-async function refresh() {
-  await busy(async () => {
-    await startJob("balance")
-    await startJob("tasks")
-    await startJob("invite")
-    log("刷新", "已启动余额 / 任务 / 邀请 三个刷新任务（共享并发上限，串行启动）")
-  }, "刷新")
-}
-
 async function loadSettings() {
   try {
     const result = await api("/api/settings")
     // ⚠ 兼容两种形状：新接口是 `{ok,settings,defaults}`，旧 mock/旧服务端是扁平对象
     const settings = result.settings ?? result
     state.panel = {
-      batchConcurrency: Number(settings.batchConcurrency) || 2,
+      ...state.panel,
+      routeConcurrency: Number(settings.routeConcurrency) || Number(settings.batchConcurrency) || 2,
+      batchConcurrency: Number(settings.batchConcurrency) || Number(settings.routeConcurrency) || 2,
       balanceConcurrency: Number(settings.balanceConcurrency) || 2,
+      tasksConcurrency: Number(settings.tasksConcurrency) || 2,
+      inviteConcurrency: Number(settings.inviteConcurrency) || 2,
+      gapMs: Number.isInteger(Number(settings.gapMs)) && Number(settings.gapMs) >= 0 ? Number(settings.gapMs) : 300,
+      autoApply: settings.autoApply !== false,
+      magpiePath: String(settings.magpiePath ?? ""),
       batchSkipChecked: settings.batchSkipChecked !== false,
       ledgerReads: Number(settings.ledgerReads) || 3,
       // 严格 `=== true`：字段缺失 / 旧服务端 → 关（宁可不动，也不偷偷重读）
@@ -781,9 +799,14 @@ async function loadSettings() {
         $(selector).value = String(value)
         cacheConcurrency(key, value)
       }
+      state.panel[key] = Number($(selector).value) || 20
     }
+    // ⚠ 只有**读成功**才允许 syncSettingsFields 回填老两个并发控件；
+    //    否则首屏那一次同步会把 localStorage 里的值冲成默认 20。
+    state.panel.synced = true
     syncSettingsFields()
   } catch (e) {
+    state.panel.synced = false
     return `并发设置读取失败，使用本地缓存或默认 20：${e.message}`
   }
 }
@@ -818,8 +841,15 @@ for (const [key, selector] of Object.entries(concurrencyFields)) {
     try { value = integer(selector) } catch (e) { toast(`并发设置未保存：${e.message}`, true); return }
     cacheConcurrency(key, value)
     settingsSave = settingsSave.then(async () => {
-      try { await api("/api/settings", { [key]: value }) }
-      catch (e) { toast(`并发设置保存失败，当前输入仍可使用：${e.message}`, true) }
+      try {
+        await api("/api/settings", { [key]: value })
+        // 回读确认落盘（与 saveSetting 同一口径：POST 成功 ≠ 已落盘）
+        const readBack = await api("/api/settings")
+        const saved = Number((readBack.settings ?? readBack)?.[key])
+        if (saved !== value) throw new Error(`回读不一致（提交 ${value}，服务端 ${Number.isNaN(saved) ? "缺失" : saved}）`)
+        state.panel[key] = value
+        state.panel.synced = true
+      } catch (e) { toast(`并发设置保存失败，当前输入仍可使用：${e.message}`, true) }
     })
     return settingsSave
   })
@@ -891,7 +921,8 @@ $$(".tab").forEach((tab, index, tabs) => {
     tabs[next].focus()
   })
 })
-$("#refresh").addEventListener("click", refresh)
+// ⚠ T-49：「刷新全部（余额·任务·邀请）」按钮已删除（一下点就会把三个队列全量打上游）。
+// 刷新入口只剩下面这些用户主动点的独立按钮，各自只能动自己那一条数据。
 // 邀请码页的刷新：有勾选就只跑勾选的号，否则整池（两者都进同一个刷新队列）
 $("#invite-refresh").addEventListener("click", () => busy(async () => {
   const uids = [...state.selected]
@@ -1007,7 +1038,164 @@ $("#bind-run").addEventListener("click", () => {
     await afterOperation([invites(), balances()], `绑定结果：成功 ${result.bound ?? 0}，失败 ${result.failed ?? 0}，未分配 ${result.unassigned ?? 0}`, bad)
   }, "绑定")
 })
+// ── 邀请码分配（健康码的码池 → 未绑账号）───────────────────────────
+//
+// 三条硬约束（T-50）：
+//   ① 打开页面**零上游**：这里只读 `GET /api/invite/pool`，而且只在**点开这个 tab**
+//      或用户点按钮时才读；首屏那 5 个 GET 的集合一个字不改。
+//   ② 扫描 / 分配都是用户在页面上点出来的 job，进度靠轮询；
+//   ③ 分配前先干跑，把「会发多少次绑定请求」写在确认框里，不让用户盲点。
+const assignState = { loaded: false, at: 0, codes: [], unbound: [], totals: { poolLeft: 0, unboundCount: 0 }, job: null }
+let assignTimer = 0
+const ASSIGN_POLL_MS = 1500
+
+// 邀请码分配 tab：**只在用户点开它时**读一次码池缓存（零上游，首屏一个字节不多）
+$("#tab-assign").addEventListener("click", () => {
+  void api("/api/invite/pool").then(applyPool).catch(() => {})
+})
+
+// ── 邀请码分配 · 执行（点按钮才发请求；打开页面一律不触发）────────────
+
+function renderAssign() {
+  const t = assignState.totals ?? {}
+  const setText = (id, text) => { const el = $(id); if (el) el.textContent = text }
+  const left = Number(t.poolLeft) || 0
+  const unboundCount = Number(t.unboundCount) || 0
+  const unlimitedCount = assignState.codes.filter((c) => c?.unlimited).length
+  // 可配对 = min(码池, 未绑)：不限次的码自己就够配下所有未绑号
+  const pairs = Math.min(left + (unlimitedCount > 0 ? unboundCount : 0), unboundCount)
+  if (!assignState.loaded) {
+    setText("#stat-assign-pool", "—")
+    setText("#stat-assign-unbound", "—")
+    setText("#stat-assign-pairs", "—")
+  } else {
+    setText("#stat-assign-pool", unlimitedCount > 0 ? `${num(left)}+（含 ${unlimitedCount} 个不限次）` : num(left))
+    setText("#stat-assign-unbound", num(unboundCount))
+    setText("#stat-assign-pairs", num(pairs))
+  }
+  setText("#assign-codes-summary", assignState.codes.length ? `${assignState.codes.length} 个码` : "")
+  setText("#assign-unbound-summary", assignState.unbound.length ? `${assignState.unbound.length} 个号` : "")
+  setText("#assign-at", assignState.at ? `码池扫描于 ${clock(assignState.at)}（只读缓存；点「扫描码池」才更新）` : "还没扫描过")
+
+  const job = assignState.job
+  const running = job?.running === true
+  const scan = $("#assign-scan"); if (scan) scan.disabled = running
+  const run = $("#assign-run"); if (run) run.disabled = running || pairs === 0
+  const stop = $("#assign-stop"); if (stop) stop.disabled = !running
+  if (job) {
+    const tail = job.stopped === "stopped-by-user" ? "（已手动停止）" : job.stopped ? "（上游限流，已停止）" : ""
+    setText("#assign-hint", `${job.kind === "scan" ? "扫描" : "分配"}中 ${job.done}/${job.total} · 成功 ${job.okCount} · 失败 ${job.failCount}${tail}`)
+  } else {
+    setText("#assign-hint", "")
+  }
+
+  const codesEl = $("#assign-codes")
+  if (codesEl) {
+    codesEl.innerHTML = assignState.codes.length
+      ? `<table><thead><tr><th>邀请码</th><th>所属账号</th><th>已用 / 上限</th><th>剩余</th><th>状态</th></tr></thead><tbody>${assignState.codes.map((c) => `<tr><td class="mono">${esc(c.code)}</td><td title="${esc(c.ownerUid)}">${esc(c.ownerName || c.ownerUid)}</td><td class="mono">${num(c.usedCount)} / ${c.unlimited ? "不限" : num(c.maxUses)}</td><td class="mono">${c.unlimited ? "不限" : num(c.left)}</td><td>${badge(c.unlimited ? "不限次" : "可用", "done")}</td></tr>`).join("")}</tbody></table>`
+      : '<div class="empty">还没有扫描过：点上面的「扫描码池」（这一步会请求上游）</div>'
+  }
+
+  const unboundEl = $("#assign-unbound")
+  if (unboundEl) {
+    const results = job?.results ?? {}
+    unboundEl.innerHTML = assignState.unbound.length
+      ? `<table><thead><tr><th>手机号 / 昵称</th><th>状态</th><th>结果</th></tr></thead><tbody>${assignState.unbound.map((u) => {
+          const r = results[u.uid]
+          const cell = !r
+            ? '<span class="muted">待绑定</span>'
+            : r.status === "bound"
+              ? badge(`已绑 ${r.code || ""}`, "done")
+              : r.status === "already-activated"
+                ? badge("已绑过，跳过")
+                : `<span class="error">${esc(r.error || r.status || "失败")}</span>`
+          const label = u.verdict === "clean" ? "健康" : u.verdict === "expired" ? "登录失效" : u.verdict === "routed" ? "被限制" : u.verdict === "exhausted" ? "积分不足" : "未检测"
+          return `<tr><td title="${esc(u.uid)}">${esc(u.name || u.uid)}</td><td>${badge(label, u.verdict === "clean" ? "done" : "fail")}</td><td>${cell}</td></tr>`
+        }).join("")}</tbody></table>`
+      : '<div class="empty">还没有未绑账号的数据：先扫描</div>'
+  }
+}
+
+async function poolState() {
+  applyPool(await api("/api/invite/pool"))
+  return assignState
+}
+
+function applyPool(result) {
+  assignState.at = Number(result.at) || 0
+  assignState.codes = Array.isArray(result.codes) ? result.codes : []
+  assignState.unbound = Array.isArray(result.unbound) ? result.unbound : []
+  assignState.totals = result.totals ?? { poolLeft: 0, unboundCount: 0 }
+  assignState.loaded = true
+  renderAssign()
+}
+
+function scheduleAssignPoll(kind, jobId) {
+  clearTimeout(assignTimer)
+  assignTimer = setTimeout(async () => {
+    try {
+      const path = kind === "scan" ? "/api/invite/pool/scan" : "/api/invite/assign"
+      const result = await api(`${path}?jobId=${encodeURIComponent(jobId)}`)
+      const job = result.job
+      assignState.job = job
+      renderAssign()
+      if (job?.running) return scheduleAssignPoll(kind, jobId)
+      assignState.job = { ...job, running: false }
+      renderAssign()
+      log("分配", kind === "scan"
+        ? `码池扫描完成：${job.done}/${job.total}，失败 ${job.failCount}`
+        : `分配完成：成功 ${job.okCount}，失败 ${job.failCount}`)
+      if (job.stopped && job.stopped !== "stopped-by-user") toast("上游限流，任务已停止", true)
+      await poolState()
+    } catch (e) {
+      assignState.job = null
+      renderAssign()
+      log("分配", `进度查询失败：${e.message}`)
+      toast(`分配进度查询失败：${e.message}`, true)
+    }
+  }, ASSIGN_POLL_MS)
+}
+
+$("#assign-scan")?.addEventListener("click", () => busy(async () => {
+  const started = await api("/api/invite/pool/scan", {})
+  if (!started.jobId) {
+    log("分配", started.message || "没有需要扫描的账号")
+    await poolState()
+    return
+  }
+  assignState.job = { kind: "scan", jobId: started.jobId, total: started.total, done: 0, okCount: 0, failCount: 0, running: true, stopped: "", results: {} }
+  log("分配", `开始扫描码池：${started.total} 个账号（只取健康号的码）`)
+  renderAssign()
+  scheduleAssignPoll("scan", started.jobId)
+}, "分配"))
+
+$("#assign-stop")?.addEventListener("click", () => busy(async () => {
+  const jobId = assignState.job?.jobId
+  if (!jobId) return
+  await api("/api/invite/assign", { stop: true, jobId })
+  log("分配", "已请求停止（当前这一步跑完就停）")
+}, "分配"))
+
+$("#assign-run")?.addEventListener("click", () => busy(async () => {
+  // 干跑：先拿「会配多少对」，用户确认后才真的发绑定请求
+  const plan = await api("/api/invite/assign", { dryRun: true })
+  if (!plan.total) return toast("没有可配对的账号：先扫描码池", true)
+  const ok = typeof confirm === "function"
+    ? confirm(`将向 ${plan.total} 个未绑账号发起绑定请求（每个号 1 次，绑定后不可撤销）。继续？`)
+    : true
+  if (!ok) return log("分配", `已取消（计划 ${plan.total} 对）`)
+  const started = await api("/api/invite/assign", {})
+  if (!started.jobId) return log("分配", started.message || "没有可配对的账号")
+  assignState.job = { kind: "assign", jobId: started.jobId, total: started.total, done: 0, okCount: 0, failCount: 0, running: true, stopped: "", results: {} }
+  log("分配", `开始分配：${started.total} 对（并发/间隔取设置）`)
+  renderAssign()
+  scheduleAssignPoll("assign", started.jobId)
+}, "分配"))
+
 // ── 设置 tab：改动即保存（校验在服务端，非法值 400 不改状态） ──────────
+//
+// ⚠ 每个控件都必须在 `state.panel` 里有同名键，并由 `syncSettingsFields()` 回填：
+//    只把值写进 localStorage / 只渲染一半控件，就会出现「设了没作用、下次启动回默认」。
 function syncSettingsFields() {
   const setValue = (selector, value) => {
     const el = $(selector)
@@ -1015,31 +1203,74 @@ function syncSettingsFields() {
   }
   setValue("#setting-batch-concurrency", state.panel.batchConcurrency)
   setValue("#setting-balance-concurrency", state.panel.balanceConcurrency)
+  setValue("#setting-tasks-concurrency", state.panel.tasksConcurrency)
+  setValue("#setting-invite-concurrency", state.panel.inviteConcurrency)
+  setValue("#setting-gap-ms", state.panel.gapMs)
   setValue("#setting-ledger-reads", state.panel.ledgerReads)
+  // 老两个并发（账号列表类 / 绑定）另有 localStorage 缓存与 `changedConcurrency` 护栏，
+  // 只在服务端读成功后才由服务端值覆盖它们，否则首屏同步会把缓存值冲成默认 20。
+  if (state.panel.synced) {
+    if (!changedConcurrency.has("accountConcurrency")) setValue("#setting-account-concurrency", state.panel.accountConcurrency)
+    if (!changedConcurrency.has("bindConcurrency")) setValue("#bind-conc", state.panel.bindConcurrency)
+  }
   const skip = $("#setting-batch-skip")
   if (skip) skip.checked = state.panel.batchSkipChecked !== false
+  const autoApply = $("#setting-auto-apply")
+  if (autoApply) autoApply.checked = state.panel.autoApply === true
+  const magpiePath = $("#setting-magpie-path")
+  if (magpiePath) magpiePath.value = String(state.panel.magpiePath ?? "")
   const focusRefresh = $("#setting-focus-refresh")
   if (focusRefresh) focusRefresh.checked = state.panel.focusRefresh === true
 }
 
+/** 把服务端返回的设置并进 `state.panel`（loadSettings / saveSetting 共用口径）。 */
+function mergePanelSettings(settings) {
+  if (!settings || typeof settings !== "object") return
+  const gap = Number(settings.gapMs)
+  state.panel = {
+    ...state.panel,
+    batchConcurrency: Number(settings.batchConcurrency) || Number(settings.routeConcurrency) || state.panel.batchConcurrency,
+    routeConcurrency: Number(settings.routeConcurrency) || Number(settings.batchConcurrency) || state.panel.routeConcurrency,
+    balanceConcurrency: Number(settings.balanceConcurrency) || state.panel.balanceConcurrency,
+    tasksConcurrency: Number(settings.tasksConcurrency) || state.panel.tasksConcurrency,
+    inviteConcurrency: Number(settings.inviteConcurrency) || state.panel.inviteConcurrency,
+    gapMs: Number.isInteger(gap) && gap >= 0 ? gap : state.panel.gapMs,
+    autoApply: settings.autoApply === undefined ? state.panel.autoApply : settings.autoApply === true,
+    magpiePath: settings.magpiePath === undefined ? state.panel.magpiePath : String(settings.magpiePath),
+    batchSkipChecked: settings.batchSkipChecked === undefined ? state.panel.batchSkipChecked : settings.batchSkipChecked === true,
+    ledgerReads: Number(settings.ledgerReads) || state.panel.ledgerReads,
+    accountConcurrency: Number(settings.accountConcurrency) || state.panel.accountConcurrency,
+    bindConcurrency: Number(settings.bindConcurrency) || state.panel.bindConcurrency,
+  }
+}
+
 async function saveSetting(patch) {
   const status = $("#settings-status")
+  let readBackOk = false
   try {
-    const result = await api("/api/settings", patch)
-    const settings = result.settings ?? result
-    if (settings && typeof settings === "object") {
-      state.panel = {
-        ...state.panel,
-        batchConcurrency: Number(settings.batchConcurrency) || state.panel.batchConcurrency,
-        balanceConcurrency: Number(settings.balanceConcurrency) || state.panel.balanceConcurrency,
-        batchSkipChecked: settings.batchSkipChecked !== false,
-        ledgerReads: Number(settings.ledgerReads) || state.panel.ledgerReads,
-        focusRefresh: settings.focusRefresh === true,
-      }
+    await api("/api/settings", patch)
+    // ⚠ **回读**：POST 成功只说明服务端收下了，不代表落盘成功（别名归一 / 并发写 /
+    //    旧进程只改内存，都会造成「界面显示已保存、重启又回默认」）。所以再 GET 一次，
+    //    逐个核对这次提交的键；对不上就明确报错，不假装保存成功。
+    const readBack = await api("/api/settings")
+    readBackOk = true
+    const settings = readBack.settings ?? readBack
+    mergePanelSettings(settings)
+    // 开关只认严格 true（与 loadSettings 同一口径）
+    state.panel = { ...state.panel, focusRefresh: settings.focusRefresh === true }
+    for (const [key, want] of Object.entries(patch)) {
+      const got = settings?.[key]
+      const same = typeof want === "number" ? Number(got) === want : got === want
+      if (!same) throw new Error(`${key} 回读不一致（提交 ${want}，服务端 ${got ?? "缺失"}）`)
     }
+    state.panel.synced = true
     if (status) status.textContent = "已保存"
+    syncSettingsFields()
     render()
   } catch (e) {
+    // 回读已经拿到了 → 界面回到服务端真值，不把用户留在“看起来改成了”的假象里；
+    // 回读没拿到（POST 就失败 / 网络断）→ 保留用户输入，仅提示失败。
+    if (readBackOk) syncSettingsFields()
     if (status) status.textContent = `保存失败：${e.message}`
     toast(`设置保存失败：${e.message}`, true)
   }
@@ -1081,13 +1312,20 @@ $("#route-batch-hint")?.addEventListener("click", () => {
 /**
  * 首屏：**只读缓存**的 5 个 GET（accounts / settings / tasks / invite / route-state），
  * 一个上游请求都不发，也不触发任何刷新或探测。
+ *
+ * ⚠ 缓存行里的 `error` 是**上次真实查询**的原文，不是本次失败（`tasks()` / `invites()`
+ *    默认不因此抛），这里只把它数成「有上次查询失败」，仍按正常日志记一行。
  */
 async function loadInitial() {
   await busy(async () => {
     await balances()
     render()
     await queries([tasks(), invites(), routeStates()])
-    log("面板", "首屏已载入本地缓存（未触发任何上游请求）")
+    const loaded = state.accounts.length
+    const failures = cachedFailures()
+    log("面板", failures > 0
+      ? `首屏已载入本地缓存（${loaded} 个账号，${failures} 个账号有上次查询失败）`
+      : `首屏已载入本地缓存（${loaded} 个账号，未触发任何上游请求）`)
   }, "账号")
 }
 
@@ -1201,6 +1439,7 @@ if (typeof globalThis !== "undefined" && globalThis.addEventListener) {
 renderLogs()
 syncMode()
 syncSettingsFields()
+renderAssign()
 const settingsReady = loadSettings()
 const clockReady = renderServiceClock()
 ;(async () => {

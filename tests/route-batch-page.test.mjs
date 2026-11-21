@@ -119,7 +119,7 @@ function harness(responses) {
   const settle = async () => {
     for (let i = 0; i < 60; i += 1) {
       await tick()
-      if (pending.size === 0 && !document.querySelector("#refresh").disabled) return
+      if (pending.size === 0 && !document.querySelector("#route-refresh").disabled) return
     }
     assert.fail("页面没有结束忙碌状态")
   }

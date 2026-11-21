@@ -263,7 +263,7 @@ export async function fetchActivation(opts) {
   if (typeof activated !== "boolean") throw new PointsError("loomy: GET /points/activation 激活状态未知")
   return {
     activated,
-    applied: String(data?.inviteCode ?? data?.code ?? ""),
+    applied: String(data?.appliedInvitationCode ?? data?.inviteCode ?? data?.code ?? ""),
   }
 }
 
@@ -280,6 +280,48 @@ export async function bindInvite(opts, code) {
     path: "/points/activation",
     body: { inviteCode: String(code ?? "").trim() },
   })
+}
+
+/**
+ * 绑定邀请码并**把回执带回来**（`bindInvite` 的只读增强版）。
+ *
+ * # 为什么要多一个函数而不是改 `bindInvite`
+ *
+ * `bindInvite` 丢掉回执，而回执里有两个关键事实：
+ *
+ *   `alreadyActivated: true` —— 这个号**早就绑过了**（`code` 仍是 000000）。
+ *   实测：已绑的号再绑返回 `activated:true, alreadyActivated:true, registerReward:0,
+ *   inviteeReward:0, inviterReward:0`。这种“成功”不能算新绑定，更不能报失败，
+ *   否则批量分配会把「已经绑过」当成错误逐条重试。
+ *
+ *   `inviterReward` —— 邀请方这次实际拿到的分（可用于“健康码到底有没有拿到积分”的取证）。
+ *
+ * 旧函数签名一个字不动（其它调用方照用）；新增的叫 `bindInviteDetailed`。
+ *
+ * @param {object} opts
+ * @param {string} code
+ * @returns {Promise<{alreadyActivated: boolean, activated: boolean, registerReward: number,
+ *   inviteeReward: number, inviterReward: number, codes: any[]}>}
+ */
+export async function bindInviteDetailed(opts, code) {
+  const data = await pointsCall({
+    ...opts,
+    method: "POST",
+    path: "/points/activation",
+    body: { inviteCode: String(code ?? "").trim() },
+  })
+  const body = data && typeof data === "object" ? data : {}
+  return {
+    alreadyActivated: body.alreadyActivated === true,
+    activated: body.activated === true,
+    // 风控/拒绝：实测回执里会带 `riskControl: true`（envelope code 仍是 000000），
+    // 这种“成功”必须让调用方看得到，否则批量分配会把风控当成绑定成功继续打。
+    riskControl: body.riskControl === true,
+    registerReward: Number(body.registerReward) || 0,
+    inviteeReward: Number(body.inviteeReward) || 0,
+    inviterReward: Number(body.inviterReward) || 0,
+    codes: Array.isArray(body.invitationCodes) ? body.invitationCodes : [],
+  }
 }
 
 /**

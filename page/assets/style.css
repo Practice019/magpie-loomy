@@ -23,6 +23,8 @@ h1 { margin: 0; font-size: 20px; letter-spacing: -.7px; line-height: 1.3; }
 h2 { margin: 0; font-size: 16px; }
 .bar-sub, .section-heading p { margin: 2px 0 0; color: var(--muted); font-size: 12px; }
 .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-bottom: 12px; }
+/* 邀请码分配的三张数字卡：只有 3 个数字，用 4 列会留一块空白 */
+.stats.assign-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .stat { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 2px 8px; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; background: var(--surface); box-shadow: 0 3px 12px #24314b03; }
 .stat > span { color: var(--muted); font-size: 12px; }
 .stat strong { font-size: 20px; font-weight: 650; line-height: 1.2; font-variant-numeric: tabular-nums; }

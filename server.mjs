@@ -47,6 +47,7 @@ import {
   completeTask,
   fetchActivation,
   bindInvite,
+  bindInviteDetailed,
   fetchInvitationCodes,
   firstLogin,
 } from "./src/points.mjs"
@@ -113,6 +114,8 @@ export async function startServer(opts = {}) {
     routeJobs: new Map(),
     // 刷新任务（余额 / 任务 / 邀请码共用）：jobId → {kind,total,running,stopped,results}
     refreshJobs: new Map(),
+    // 邀请码分配任务（扫描 / 绑定）：jobId → {kind,total,done,running,stopped,results}
+    inviteJobs: new Map(),
     // 进程级并发槽 + 启动节流（三个全量任务共享，总并发不超过设置值）
     slotActive: 0,
     slotWaiters: [],
@@ -299,6 +302,12 @@ async function handle(req, res, ctx) {
   if (path === "/api/tasks-refresh-batch" && req.method === "GET") return tasksRefreshState(res, ctx, url.searchParams)
   if (path === "/api/invite-refresh-batch" && req.method === "POST") return inviteRefreshStart(req, res, ctx)
   if (path === "/api/invite-refresh-batch" && req.method === "GET") return inviteRefreshState(res, ctx, url.searchParams)
+  // 邀请码分配：码池读缓存（零上游）；扫描 / 绑定都是用户点出来的 job
+  if (path === "/api/invite/pool" && req.method === "GET") return invitePoolState(res, ctx)
+  if (path === "/api/invite/pool/scan" && req.method === "POST") return invitePoolScanStart(req, res, ctx)
+  if (path === "/api/invite/pool/scan" && req.method === "GET") return readInviteJob(res, ctx, url.searchParams, "scan")
+  if (path === "/api/invite/assign" && req.method === "POST") return inviteAssignStart(req, res, ctx)
+  if (path === "/api/invite/assign" && req.method === "GET") return readInviteJob(res, ctx, url.searchParams, "assign")
 
   sendJson(res, 404, { error: "not found" })
 }
@@ -1223,6 +1232,19 @@ function routeCheckBatchState(res, ctx, params) {
  *     一条记录都没有时才写；
  *   · 探测抛异常 → 根本不进写盘（调用方回 `ok:false`）。
  */
+/**
+ * 「账本采样次数」设置（`ledgerReads`，1..5，默认 3）。
+ *
+ * 读设置失败（文件损坏 / configDir 缺失）时回默认值 —— 一个设置项读不出来，
+ * 不该把整次探测弄挂。
+ */
+function probeLedgerReads(ctx) {
+  try {
+    const n = Number(readPanelSettings(ctx.configDir).data.ledgerReads)
+    return Number.isInteger(n) && n >= 1 && n <= 5 ? n : 3
+  } catch { return 3 }
+}
+
 function probeAccountRoute(ctx, mods, uid, session) {
   const key = String(uid)
   const inflight = ctx.routePending.get(key)
@@ -1231,7 +1253,10 @@ function probeAccountRoute(ctx, mods, uid, session) {
   const task = (async () => {
     // 唯一通道：只读判定（`probeRoute`：目录 + 账本 + 余额，0 积分）。
     // by-turn 那条通道（发一次计费 chat 再回查）T-38 已整段删除。
-    const entry = await mods.probeRoute({ baseUrl: ctx.baseUrl, session, fetchImpl: ctx.fetchImpl })
+    // ⚠ T-49：`ledgerReads`（设置里的「账本采样次数」）以前**存了却从未传下去**，
+    //    改了不生效；这里按最新设置传给探测模块。
+    const ledgerReads = probeLedgerReads(ctx)
+    const entry = await mods.probeRoute({ baseUrl: ctx.baseUrl, session, fetchImpl: ctx.fetchImpl, ledgerReads })
     if (!entry || typeof entry !== "object") throw new Error("探测模块没有返回结果")
     const kept = entry.verdict === "unknown" && hasStoredRoute(mods, ctx.configDir, uid)
     let stored = !kept
@@ -1655,6 +1680,503 @@ function inviteRefreshState(res, ctx, params) {
   return readRefreshJob(res, ctx, params, "invite")
 }
 
+// ── 邀请码分配（健康码的码池 → 未绑账号）──────────────────────────────
+//
+// # 要解决的事
+//
+// 一个号只能绑一次邀请码（永久不可改），绑谁的码就决定了**谁拿那 5K**。
+// 让废号的码被绑，等于把奖励发给一个已经不能用的号。所以这里只允许
+// 「健康（verdict === "clean"）账号的码」进池，让未绑的号去绑它们。
+//
+// # 三条铁律
+//
+//   ① 打开面板**零上游**：`GET /api/invite/pool` 只读 `loomy-invite-pool.json`；
+//   ② 扫描 / 分配都是**用户点按钮**才发的 job（并发 = inviteConcurrency，间隔 = gapMs）；
+//   ③ 已绑过的号**不重复扫**：`loomy-activation-cache.json` 里 `activated: true`
+//      永久复用（一个号绑一次就不会变），`activated: false` 只复用 10 分钟。
+//
+// 缓存文件：
+//   `loomy-invite-pool.json`     {at, codes:[{code,ownerKey,ownerUid,ownerName,maxUses,usedCount,left,unlimited,status}], unbound:[{key,uid,name,verdict}]}
+//   `loomy-activation-cache.json` {updatedAt, byUid:{uid:{activated,code,at}}}
+
+const INVITE_POOL_FILE = "loomy-invite-pool.json"
+const ACTIVATION_CACHE_FILE = "loomy-activation-cache.json"
+/** `activated: false` 的缓存寿命：短，因为「未绑」这个状态会变。 */
+const ACTIVATION_FALSE_TTL_MS = 10 * 60 * 1000
+
+function readActivationCache(configDir) {
+  // ⚠ 键名是 `entries`（与写出端、用例、面板三方对齐）：uid → {activated, code, at}
+  return readKeyedCache(configDir, ACTIVATION_CACHE_FILE, "entries")
+}
+
+/** 缓存里能直接用的激活状态（null = 不知道，得重新查）。 */
+function cachedActivation(entry) {
+  if (!isPlainObject(entry) || typeof entry.activated !== "boolean") return null
+  if (entry.activated === true) return { activated: true, code: String(entry.code ?? "") }
+  return Date.now() - (Number(entry.at) || 0) <= ACTIVATION_FALSE_TTL_MS
+    ? { activated: false, code: "" }
+    : null
+}
+
+/** 读邀请码池（缺文件 / 损坏 / 形状不对 → 空池，绝不抛）。 */
+export function readInvitePool(configDir) {
+  const empty = { at: 0, codes: [], unbound: [] }
+  if (!configDir) return empty
+  const path = join(configDir, INVITE_POOL_FILE)
+  if (!existsSync(path)) return empty
+  /** @type {any} */
+  let parsed
+  try {
+    parsed = JSON.parse(readFileSync(path, "utf8"))
+  } catch {
+    return empty
+  }
+  if (!isPlainObject(parsed)) return empty
+  const codes = (Array.isArray(parsed.codes) ? parsed.codes : []).filter(isPlainObject).map((c) => {
+    const unlimited = c.unlimited === true
+    return {
+      code: String(c.code ?? "").trim(),
+      ownerKey: String(c.ownerKey ?? ""),
+      ownerUid: String(c.ownerUid ?? ""),
+      ownerName: String(c.ownerName ?? ""),
+      maxUses: Number(c.maxUses) || 0,
+      usedCount: Number(c.usedCount) || 0,
+      status: String(c.status ?? ""),
+      unlimited,
+      // ⚠ 不限次的码也用**有限数**表达余量（至少 1）：`left: null` 会让所有
+      //    `left > 0 / left - 1` 的算术把它当成 0，「不限次」的码反而永远配不出去。
+      left: unlimited ? Math.max(1, Number(c.left) || 1) : Math.max(0, Number(c.left) || 0),
+    }
+  }).filter((c) => c.code)
+  const unbound = (Array.isArray(parsed.unbound) ? parsed.unbound : []).filter(isPlainObject).map((u) => ({
+    // `key` = 账号的**显示身份**（昵称/手机号，面板第一列）；`uid` 才是机器标识。
+    // 两者别混：混了以后表格左边出现 `loomy#3`，用户完全认不出是哪个号。
+    key: String(u.key ?? u.name ?? u.uid ?? ""),
+    uid: String(u.uid ?? ""),
+    name: String(u.name ?? u.key ?? ""),
+    authKey: String(u.authKey ?? ""),
+    verdict: String(u.verdict ?? "unknown"),
+  })).filter((u) => u.uid)
+  return { at: Number(parsed.at) || 0, codes, unbound }
+}
+
+function writeInvitePool(configDir, data) {
+  if (!configDir) throw new Error("未设置 configDir，无法保存邀请码池")
+  const path = join(configDir, INVITE_POOL_FILE)
+  const temp = path + "." + randomUUID() + ".tmp"
+  try {
+    mkdirSync(String(configDir), { recursive: true })
+    writeFileSync(temp, JSON.stringify(data, null, 2) + "\n", { flag: "wx", mode: 0o600 })
+    renameSync(temp, path)
+  } finally {
+    if (existsSync(temp)) unlinkSync(temp)
+  }
+  return data
+}
+
+/**
+ * 码池汇总（统计卡片用）。
+ *
+ * `left: null` = 不限次数（`maxUses: 0`），不能当成 0；`capacity` 把不限次
+ * 的码折算成“够不够配下所有未绑号”，避免在 JSON 里出现 Infinity。
+ */
+export function invitePoolTotals(pool) {
+  const codes = Array.isArray(pool?.codes) ? pool.codes : []
+  const unboundCount = Array.isArray(pool?.unbound) ? pool.unbound.length : 0
+  let poolLeft = 0
+  for (const c of codes) poolLeft += Math.max(0, Number(c?.left) || 0)
+  // ⚠ 形状就这两个键：面板第三张卡（可配对）由页自己算 min(码池,未绑)，
+  //    多返回字段等于把契约多开一道口子（用例是 deepEqual）。
+  return { poolLeft, unboundCount }
+}
+
+/** 一个账号自己生成的码 → 进池的条目（已耗尽 / 已用完的不进）。 */
+function poolCodesOf(owner, list) {
+  const out = []
+  for (const item of list ?? []) {
+    const code = String(item?.code ?? "").trim()
+    if (!code) continue
+    const status = String(item?.status ?? "")
+    if (status === "exhausted") continue
+    const maxUses = Number(item?.maxUses) || 0
+    const usedCount = Number(item?.usedCount) || 0
+    const base = { code, ownerKey: owner.key, ownerUid: owner.uid, ownerName: owner.name, maxUses, usedCount, status }
+    if (maxUses === 0) {
+      // 0 = 不限次数。`left` 表达成「至少还能绑 1 次」的有限数：
+      // 面板/配对都要用 `left` 做比较，给 null 或 Infinity 迟早会把它算成 0
+      // 或被 JSON.stringify 变成 null，于是「不限次的大码」被当成用完的码。
+      // `unlimited: true` 才是「真的不限」的权威标记。
+      out.push({ ...base, unlimited: true, left: Math.max(1, Number(item?.capacity) || 1) })
+      continue
+    }
+    const left = Math.max(0, maxUses - usedCount)
+    if (left === 0) continue
+    out.push({ ...base, unlimited: false, left })
+  }
+  return out
+}
+
+/** uid → plugin-auth 里的键（`loomy` / `loomy#3`），只用于展示与回写。 */
+function authKeyByUid(configDir) {
+  const map = new Map()
+  if (!configDir) return map
+  const file = join(configDir, "plugin-auth.json")
+  if (!existsSync(file)) return map
+  /** @type {any} */
+  let all
+  try {
+    all = JSON.parse(readFileSync(file, "utf8"))
+  } catch {
+    return map
+  }
+  for (const [key, value] of Object.entries(all ?? {})) {
+    if (key !== PROVIDER && !key.startsWith(PROVIDER + "#")) continue
+    const meta = /** @type {any} */ (value)?.metadata ?? {}
+    const uid = String(meta.uid ?? /** @type {any} */ (value)?.uid ?? "").trim()
+    if (uid) map.set(uid, key)
+  }
+  return map
+}
+
+/** 读已落盘的路由结论（读不出来就当全未检测，不影响扫描）。 */
+async function routeVerdicts(ctx) {
+  try {
+    const mods = await ensureRouteModules(ctx)
+    if (!mods || typeof mods.readRouteState !== "function") return {}
+    const read = mods.readRouteState(ctx.configDir)
+    return read?.ok && isPlainObject(read.data) ? read.data : {}
+  } catch {
+    return {}
+  }
+}
+
+function startInviteJob(ctx, kind, items) {
+  const jobId = randomUUID()
+  const job = {
+    jobId, kind, total: items.length, done: 0, okCount: 0, failCount: 0, skipCount: 0,
+    running: true, stopped: "", results: /** @type {Record<string, object>} */ ({}),
+    codes: [], unbound: [],
+  }
+  ctx.inviteJobs.set(jobId, job)
+  return job
+}
+
+function finishInviteJob(ctx, job) {
+  job.running = false
+  const timer = setTimeout(() => { ctx.inviteJobs.delete(job.jobId) }, ROUTE_JOB_TTL_MS)
+  timer.unref?.()
+}
+
+/** `GET /api/invite/pool` → 只读缓存，零上游。 */
+function invitePoolState(res, ctx) {
+  const pool = ctx.configDir ? readInvitePool(ctx.configDir) : { at: 0, codes: [], unbound: [] }
+  return sendJson(res, 200, {
+    ok: true,
+    at: pool.at,
+    codes: pool.codes,
+    unbound: pool.unbound,
+    totals: invitePoolTotals(pool),
+  })
+}
+
+/**
+ * `POST /api/invite/pool/scan`：扫「健康码的码」+ 「未绑账号」，job 化。
+ *
+ * 只扫 `verdict === "clean"` 的号去拿码（用户明确：邀请者必须健康）；
+ * 激活状态逐号查 `GET /points/activation`，`expired` 默认跳过（号已死，别浪费请求）。
+ */
+async function invitePoolScanStart(req, res, ctx) {
+  /** @type {any} */
+  let input
+  try {
+    input = JSON.parse((await readBody(req, 1 << 16)) || "{}")
+  } catch {
+    return sendJson(res, 400, { ok: false, error: "参数不是合法 JSON" })
+  }
+  if (!isPlainObject(input)) return sendJson(res, 400, { ok: false, error: "参数必须是 JSON 对象" })
+  if (!ctx.configDir) return sendJson(res, 503, { ok: false, error: "未设置 configDir，无法保存邀请码池" })
+
+  const accounts = [...new Map(readMagpieAuth(ctx.configDir).map((a) => [a.uid, a])).values()]
+  const wanted = Array.isArray(input.uids) ? new Set(input.uids.map((u) => String(u).trim()).filter(Boolean)) : null
+  const list = wanted ? accounts.filter((a) => wanted.has(a.uid)) : accounts
+  if (!list.length) return sendJson(res, 200, { ok: true, jobId: "", total: 0, message: "没有需要扫描的账号" })
+
+  const settings = readPanelSettings(ctx.configDir).data
+  const concurrency = Math.max(1, Math.min(concurrencyFor("invite", settings), list.length))
+  const job = startInviteJob(ctx, "scan", list)
+  void runPoolScan(ctx, job, list, input.includeExpired === true, concurrency)
+  return sendJson(res, 200, { ok: true, jobId: job.jobId, total: job.total })
+}
+
+async function runPoolScan(ctx, job, list, includeExpired, concurrency) {
+  const verdicts = await routeVerdicts(ctx)
+  const activations = readActivationCache(ctx.configDir).entries
+  const keys = authKeyByUid(ctx.configDir)
+  let cursor = 0
+  let consecutiveRateLimit = 0
+  const worker = async () => {
+    for (;;) {
+      if (job.stopped) return
+      const index = cursor++
+      if (index >= list.length) return
+      const account = list[index]
+      await refreshGate(ctx)
+      if (job.stopped) return
+      const entry = isPlainObject(verdicts[account.uid]) ? verdicts[account.uid] : {}
+      const verdict = String(entry.verdict ?? "unknown")
+      // 健康 = clean + 实际落地不是降级模型（routed 的另一种表现，双保险）
+      const healthy = verdict === "clean" && String(entry.servedModel ?? "") !== "spark-x2.6-low"
+      const base = { baseUrl: ctx.baseUrl, auth: { session: account.session }, fetchImpl: ctx.fetchImpl }
+      const owner = { key: account.nickname || account.phone || shortUID(account.uid), uid: account.uid, name: account.nickname || shortUID(account.uid), authKey: keys.get(account.uid) ?? "" }
+      let error = ""
+      let codeList = []
+      if (healthy) {
+        try {
+          codeList = poolCodesOf(owner, await withSlot(ctx, () => fetchInvitationCodes(base)))
+        } catch (e) {
+          error = sanitizeError(e, account.session)
+        }
+      }
+      let activation = cachedActivation(activations[account.uid])
+      if (!activation) {
+        const skipExpired = verdict === "expired" && !includeExpired
+        if (!skipExpired) {
+          try {
+            const got = await withSlot(ctx, () => fetchActivation(base))
+            activation = { activated: got.activated === true, code: String(got.applied ?? "") }
+            try {
+              writeKeyedCache(ctx.configDir, ACTIVATION_CACHE_FILE, "entries", account.uid, { activated: activation.activated, code: activation.code, at: Date.now() })
+            } catch {}
+          } catch (e) {
+            error = error || sanitizeError(e, account.session)
+          }
+        }
+      }
+      for (const c of codeList) job.codes.push(c)
+      // ⚠ 只把**非健康**的未绑号放进 unbound：健康号是供码方，它自己不需要绑别人的码。
+      //    `key` 就用 uid（面板与用例都按 uid 指代账号）。
+      if (activation && activation.activated === false && !healthy) job.unbound.push({ key: account.uid, uid: account.uid, name: owner.name, verdict })
+      job.done += 1
+      if (error) job.failCount += 1
+      else job.okCount += 1
+      if (isRateLimitFailure({ error })) {
+        consecutiveRateLimit += 1
+        if (consecutiveRateLimit >= BATCH_BREAKER) job.stopped = "upstream-rate-limited"
+      } else {
+        consecutiveRateLimit = 0
+      }
+      job.results[account.uid] = { ok: !error, healthy, verdict, activation: activation ? activation.activated : null, codes: codeList.length, error }
+    }
+  }
+  try {
+    await Promise.all(Array.from({ length: Math.max(1, concurrency) }, worker))
+  } catch (e) {
+    ctx.log.warn?.(`loomy panel: 邀请码池扫描异常收尾: ${String(e?.message ?? e).slice(0, 200)}`)
+  } finally {
+    try {
+      const dedup = new Map()
+      for (const c of job.codes) dedup.set(`${c.ownerUid}:${c.code}`, c)
+      const codes = [...dedup.values()].sort((a, b) => a.ownerUid.localeCompare(b.ownerUid) || a.code.localeCompare(b.code))
+      const unbound = [...new Map(job.unbound.map((u) => [u.uid, u])).values()].sort((a, b) => a.uid.localeCompare(b.uid))
+      writeInvitePool(ctx.configDir, { at: Date.now(), codes, unbound })
+    } catch (e) {
+      ctx.log.warn?.(`loomy panel: 邀请码池写盘失败: ${String(e?.message ?? e).slice(0, 200)}`)
+    }
+    finishInviteJob(ctx, job)
+  }
+}
+
+/**
+ * 配对策略：**优先消耗 left 最大的码**（让老号的大码先用完，小码不浪费）。
+ *
+ * 排序规则（唯一一份，别在别处再过一遍）：
+ *   ① 有限次数的码优先于不限次的码 —— 小码不先消耗掉，高峰期会被风控卡在
+ *      「大码没用完、小码过期」的尴尬状态；
+ *   ② 同为有限次数时，`left` 大的优先；
+ *   ③ 同一个码可以连续配给多个未绑号（按 `left` 递减）。
+ */
+export function planInviteAssignments(pool, wantedUids) {
+  const unbound = Array.isArray(pool?.unbound) ? pool.unbound : []
+  const codes = (Array.isArray(pool?.codes) ? pool.codes : []).filter((c) => c?.unlimited || (Number(c?.left) || 0) > 0)
+  const targets = wantedUids ? unbound.filter((u) => wantedUids.has(u.uid)) : unbound
+  const sorted = [...codes].sort((a, b) => {
+    if (Boolean(a.unlimited) !== Boolean(b.unlimited)) return a.unlimited ? 1 : -1
+    return (Number(b.left) || 0) - (Number(a.left) || 0)
+  })
+  const left = new Map(sorted.map((c) => [c.code, c.unlimited ? Number.POSITIVE_INFINITY : Math.max(0, Number(c.left) || 0)]))
+  const pairs = []
+  for (const target of targets) {
+    const pick = sorted.find((c) => (left.get(c.code) ?? 0) > 0)
+    if (!pick) break
+    left.set(pick.code, left.get(pick.code) - 1)
+    pairs.push({ uid: target.uid, key: target.key, name: target.name, authKey: target.authKey ?? "", verdict: target.verdict, code: pick.code, ownerUid: pick.ownerUid, ownerKey: pick.ownerKey })
+  }
+  return pairs
+}
+
+/** 绑定成功后扣一次码余量（不限次的只加 usedCount）。 */
+function consumePoolCode(configDir, code) {
+  try {
+    const pool = readInvitePool(configDir)
+    const hit = pool.codes.find((c) => c.code === code)
+    if (!hit) return
+    hit.usedCount = (Number(hit.usedCount) || 0) + 1
+    if (!hit.unlimited) hit.left = Math.max(0, (Number(hit.left) || 0) - 1)
+    writeInvitePool(configDir, pool)
+  } catch {}
+}
+
+function dropPoolCode(configDir, code) {
+  try {
+    const pool = readInvitePool(configDir)
+    const hit = pool.codes.find((c) => c.code === code)
+    if (!hit || hit.unlimited) return
+    hit.left = 0
+    writeInvitePool(configDir, pool)
+  } catch {}
+}
+
+/**
+ * `POST /api/invite/assign`：按策略配对并执行绑定。
+ *
+ * body: `{ uids?, dryRun?, stop?, jobId? }`
+ *   · `dryRun: true` → 只回配对方案，一个上游请求都不发（默认建议先干跑）；
+ *   · `stop: true`   → 停掉指定 job（`jobId`）；
+ *   · 其余情况 → 启动绑定 job，立刻回 jobId。
+ */
+async function inviteAssignStart(req, res, ctx) {
+  /** @type {any} */
+  let input
+  try {
+    input = JSON.parse((await readBody(req, 1 << 16)) || "{}")
+  } catch {
+    return sendJson(res, 400, { ok: false, error: "参数不是合法 JSON" })
+  }
+  if (!isPlainObject(input)) return sendJson(res, 400, { ok: false, error: "参数必须是 JSON 对象" })
+  if (!ctx.configDir) return sendJson(res, 503, { ok: false, error: "未设置 configDir，无法分配邀请码" })
+
+  if (input.stop === true) {
+    const job = ctx.inviteJobs.get(String(input.jobId ?? "").trim())
+    if (!job || job.kind !== "assign") return sendJson(res, 404, { ok: false, error: "没有这个分配任务" })
+    job.stopped = job.stopped || "stopped-by-user"
+    return sendJson(res, 200, { ok: true, jobId: job.jobId, stopped: true })
+  }
+
+  const pool = readInvitePool(ctx.configDir)
+  const wanted = Array.isArray(input.uids) ? new Set(input.uids.map((u) => String(u).trim()).filter(Boolean)) : null
+  const pairs = planInviteAssignments(pool, wanted)
+  if (input.dryRun === true) {
+    return sendJson(res, 200, { ok: true, dryRun: true, total: pairs.length, pairs: pairs.slice(0, 500), totals: invitePoolTotals(pool) })
+  }
+  if (!pairs.length) {
+    return sendJson(res, 200, { ok: true, jobId: "", total: 0, pairs: [], message: "没有可配对的账号（先扫描码池）" })
+  }
+
+  const settings = readPanelSettings(ctx.configDir).data
+  const job = startInviteJob(ctx, "assign", pairs)
+  void runAssign(ctx, job, pairs, Math.max(1, Math.min(concurrencyFor("invite", settings), pairs.length)))
+  return sendJson(res, 200, { ok: true, jobId: job.jobId, total: job.total, plan: pairs.slice(0, 200) })
+}
+
+async function runAssign(ctx, job, pairs, concurrency) {
+  const accounts = new Map(readMagpieAuth(ctx.configDir).map((a) => [a.uid, a]))
+  let cursor = 0
+  const worker = async () => {
+    for (;;) {
+      if (job.stopped) return
+      const index = cursor++
+      if (index >= pairs.length) return
+      const pair = pairs[index]
+      await refreshGate(ctx)
+      if (job.stopped) return
+      const account = accounts.get(pair.uid)
+      if (!account) {
+        job.done += 1
+        job.failCount += 1
+        job.results[pair.uid] = { status: "failed", kind: "other", code: pair.code, error: "找不到账号 session" }
+        continue
+      }
+      const base = { baseUrl: ctx.baseUrl, auth: { session: account.session }, fetchImpl: ctx.fetchImpl }
+      let result
+      try {
+        const detail = await withSlot(ctx, () => bindInviteDetailed(base, pair.code))
+        if (detail.riskControl) {
+          // 风控：envelope 仍是 000000，只能靠回执里的 riskControl 识别 —— 立即停整组
+          result = { status: "risk-control", code: pair.code, error: "上游风控（riskControl）", stop: "risk-control" }
+        } else if (detail.alreadyActivated) {
+          // 已绑过：不是失败，也不能算新绑定（奖励为 0），继续下一个
+          result = { status: "already-activated", code: pair.code }
+        } else {
+          try {
+            writeKeyedCache(ctx.configDir, ACTIVATION_CACHE_FILE, "entries", pair.uid, { activated: true, code: pair.code, at: Date.now() })
+          } catch {}
+          consumePoolCode(ctx.configDir, pair.code)
+          result = { status: "bound", code: pair.code, inviterReward: detail.inviterReward, inviteeReward: detail.inviteeReward }
+        }
+      } catch (e) {
+        const error = sanitizeError(e, account.session)
+        if (/邀请码已用完|已用完|exhausted/i.test(error)) {
+          dropPoolCode(ctx.configDir, pair.code)
+          result = { status: "failed", kind: "code-empty", code: pair.code, error }
+        } else if (/** @type {any} */ (e)?.rateLimited === true || isRateLimitFailure({ error })) {
+          // 风控/限流：立即停掉整个 job，剩下的号一次都不打
+          result = { status: "risk-control", code: pair.code, error, stop: "risk-control" }
+        } else if (/账号已激活|已激活/i.test(error)) {
+          result = { status: "already-activated", code: pair.code }
+        } else {
+          result = { status: "failed", kind: "other", code: pair.code, error }
+        }
+      }
+      job.done += 1
+      if (result.status === "bound") job.okCount += 1
+      else if (result.status === "already-activated") job.skipCount += 1
+      else job.failCount += 1
+      job.results[pair.uid] = result
+      if (result.stop) job.stopped = String(result.stop)
+    }
+  }
+  try {
+    await Promise.all(Array.from({ length: Math.max(1, concurrency) }, worker))
+  } catch (e) {
+    ctx.log.warn?.(`loomy panel: 邀请码分配异常收尾: ${String(e?.message ?? e).slice(0, 200)}`)
+  } finally {
+    try {
+      const pool = readInvitePool(ctx.configDir)
+      const bound = new Set(Object.entries(job.results)
+        .filter(([, r]) => isPlainObject(r) && (r.status === "bound" || r.status === "already-activated"))
+        .map(([uid]) => uid))
+      pool.unbound = pool.unbound.filter((u) => !bound.has(u.uid))
+      pool.at = Date.now()
+      writeInvitePool(ctx.configDir, pool)
+    } catch (e) {
+      ctx.log.warn?.(`loomy panel: 邀请码池回写失败: ${String(e?.message ?? e).slice(0, 200)}`)
+    }
+    finishInviteJob(ctx, job)
+  }
+}
+
+/** `GET /api/invite/{pool/scan|assign}?jobId=` → 进度（按 kind 校验）。 */
+function readInviteJob(res, ctx, params, kind) {
+  const jobId = String(params.get("jobId") ?? "").trim()
+  const job = jobId ? ctx.inviteJobs.get(jobId) : null
+  if (!job || job.kind !== kind) return sendJson(res, 404, { ok: false, error: "没有这个任务" })
+  return sendJson(res, 200, {
+    ok: true,
+    job: {
+      jobId: job.jobId,
+      kind: job.kind,
+      total: job.total,
+      done: job.done,
+      okCount: job.okCount,
+      skipCount: job.skipCount ?? 0,
+      failCount: job.failCount,
+      running: job.running,
+      stopped: job.stopped || "",
+      results: job.results,
+    },
+  })
+}
+
 /** 错误一句话、去掉 session。 */
 function sanitizeError(error, session) {
   const text = String(error?.message ?? error ?? "").trim() || "未知错误"
@@ -1954,18 +2476,24 @@ async function savePanelSettings(req, res, ctx) {
   const legacy = {}
   /** @type {Record<string, any>} */
   const panel = {}
+  // ⚠ T-49：未知字段**忽略**（不报错、不落盘）——客户端多带一个键不该把整次设置
+  //    保存打回 400；但只要**一个可识别的键都没有**，仍然按旧行为 400（拦住
+  //    「拼错键名 → 以为存上了」那种静默失败）。
+  let known = 0
   for (const [key, value] of Object.entries(input)) {
-    if (!accepted.includes(key)) return sendJson(res, 400, { error: `仅接受 ${accepted.join("/")}，值必须合法` })
+    if (!accepted.includes(key)) continue
+    known += 1
     if (key === "accountConcurrency" || key === "bindConcurrency") {
       if (!validConcurrency(value)) return sendJson(res, 400, { error: "accountConcurrency/bindConcurrency 必须是 ≥1 的整数" })
       legacy[key] = value
       continue
     }
     if (!validPanelSetting(key, value)) {
-      return sendJson(res, 400, { error: key === "batchConcurrency" || key === "balanceConcurrency" ? `${key} 必须是 ≥1 的整数` : key === "ledgerReads" ? "ledgerReads 必须是 1..5 的整数" : key === "focusRefresh" ? "focusRefresh 必须是布尔值" : "batchSkipChecked 必须是布尔值" })
+      return sendJson(res, 400, { error: key === "batchConcurrency" || key === "balanceConcurrency" ? `${key} 必须是 ≥1 的整数` : key === "ledgerReads" ? "ledgerReads 必须是 1..5 的整数" : key === "focusRefresh" ? "focusRefresh 必须是布尔值" : key === "gapMs" ? "gapMs 必须是 0..5000 的整数" : "值必须合法" })
     }
     panel[key] = value
   }
+  if (!known) return sendJson(res, 400, { error: `仅接受 ${accepted.join("/")}，值必须合法` })
   if (!ctx.configDir) return sendJson(res, 503, { error: "未设置 configDir，无法持久保存设置" })
   try {
     if (Object.keys(legacy).length) {

@@ -165,7 +165,7 @@ function harness(rows) {
   const settle = async () => {
     for (let i = 0; i < 80; i += 1) {
       await new Promise((r) => setImmediate(r))
-      if (pending.size === 0 && !document.querySelector("#refresh").disabled) return
+      if (pending.size === 0 && !document.querySelector("#route-refresh").disabled) return
     }
     assert.fail("页面没有结束忙碌状态")
   }

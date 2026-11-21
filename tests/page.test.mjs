@@ -122,7 +122,7 @@ async function fixture(handler, navigator = {}, localStorage) {
   const settle = async () => {
     for (let i = 0; i < 40; i++) {
       await tick()
-      if (pending.size === 0 && !document.querySelector("#refresh").disabled) return
+      if (pending.size === 0 && !document.querySelector("#route-refresh").disabled) return
     }
     assert.fail("页面未结束忙碌状态")
   }
@@ -271,12 +271,12 @@ test("真实 app 首屏加载 mock 账号、任务、积分与三态邀请字段
   assert.match(f.get("#stat-unhealthy-note").textContent, /另有 2 个未检测/)
 })
 
-test("三标签页及方向键、Home、End 切换与 ARIA 状态对应", async () => {
+test("五标签页及方向键、Home、End 切换与 ARIA 状态对应", async () => {
   const f = await fixture()
-  assert.equal(f.document.querySelectorAll(".tab").length, 4)
-  assert.equal(f.document.querySelectorAll(".pane").length, 4)
+  assert.equal(f.document.querySelectorAll(".tab").length, 5)
+  assert.equal(f.document.querySelectorAll(".pane").length, 5)
   const check = (active) => {
-    for (const name of ["accounts", "invite", "logs", "settings"]) {
+    for (const name of ["accounts", "invite", "assign", "logs", "settings"]) {
       const on = name === active
       assert.equal(f.get(`#pane-${name}`).hidden, !on)
       assert.equal(f.get(`#tab-${name}`).getAttribute("aria-selected"), String(on))
@@ -288,7 +288,7 @@ test("三标签页及方向键、Home、End 切换与 ARIA 状态对应", async 
   check("accounts")
   await f.get("#tab-invite").click()
   check("invite")
-  for (const [from, key, to] of [["invite", "ArrowRight", "logs"], ["logs", "ArrowRight", "settings"], ["settings", "ArrowRight", "accounts"], ["accounts", "ArrowLeft", "settings"], ["logs", "Home", "accounts"], ["accounts", "End", "settings"], ["logs", "ArrowLeft", "invite"]]) {
+  for (const [from, key, to] of [["invite", "ArrowRight", "assign"], ["assign", "ArrowRight", "logs"], ["logs", "ArrowRight", "settings"], ["settings", "ArrowRight", "accounts"], ["accounts", "ArrowLeft", "settings"], ["logs", "Home", "accounts"], ["accounts", "End", "settings"], ["logs", "ArrowLeft", "assign"]]) {
     let prevented = false
     await f.get(`#tab-${from}`).emit("keydown", { key, preventDefault() { prevented = true } })
     check(to)
@@ -404,9 +404,9 @@ test("忙碌时禁用操作且直接重复事件也不重发请求", async () =>
   await f.input("#bind-codes", "CODE")
   await f.get("#bind-run").click()
   try {
-    for (const id of ["bind-run", "refresh", "invite-refresh", "account-repair"]) assert.equal(f.get(`#${id}`).disabled, true, id)
+    for (const id of ["bind-run", "route-refresh", "invite-refresh", "account-repair"]) assert.equal(f.get(`#${id}`).disabled, true, id)
     await f.get("#bind-run").emit("click")
-    await f.get("#refresh").emit("click")
+    await f.get("#route-refresh").emit("click")
     await f.get("#invite-list").emit("click", { target: f.get('[data-bind-uid="u0"]') })
     assert.equal(f.calls.filter((c) => c.path === "/api/do").length, 1)
     assert.equal(f.calls.length, 7)
@@ -486,7 +486,8 @@ test("日志只在第三页聚合，包含时间来源，可复制和清空", as
   assert.match(text, /\[[^\]\n]+\] \[账号\] 开始补齐任务/)
   assert.match(text, /\[[^\]\n]+\] \[绑定\] 开始绑定/)
   // 首屏日志措辞已统一（T-35）：说清「只读了本地缓存、没发上游」（原来是「已读取本地缓存」）
-  assert.match(text, /\[面板\] 首屏已载入本地缓存（未触发任何上游请求）/)
+  // 首屏日志措辞（T-49）：报清「几个账号 + 只读了缓存」。
+  assert.match(text, /\[面板\] 首屏已载入本地缓存（3 个账号，未触发任何上游请求）/)
   await f.get("#logs-copy").click()
   assert.deepEqual(copied, [text])
   await f.get("#logs-clear").click()
@@ -628,14 +629,29 @@ test("首次查询网络失败使用人话且不触发写操作", async () => {
   assert.equal(f.get("#status").className, "status bad")
 })
 
-// ⚠ accounts 不在这一组了：缓存里的「上次查询失败」是提示，不是页面错误
-//（面板不自动查余额，某个号上次失败不该把整页标红）
+// ⚠ T-49：`/api/tasks` / `/api/invite` 也是**只读缓存**，行内 `error` 是上次真实查询
+// 的原文，不是本次失败 —— 首屏不得因此标红、不得打「失败：」，但行内必须继续显示。
 for (const path of ["/api/tasks", "/api/invite"]) {
-  test(`${path} 局部业务查询错误不显示更新成功`, async () => {
-    const f = await fixture((c) => c.path === path ? response({ rows: [{ uid: "u0", error: "mock rejected" }] }) : undefined)
-    assert.equal(f.get("#status").className, "status bad")
+  test(`${path} 缓存里的旧 error 不把首屏打成失败，但仍在行内显示`, async () => {
+    const f = await fixture((c) => c.path === path ? response({ rows: [{ uid: "u0", error: "mock rejected", cached: true }] }) : undefined)
+    assert.equal(f.get("#status").className, "status ok", "缓存里的历史错误不是本次失败")
+    assert.doesNotMatch(f.get("#operation-log").textContent, /失败：/, "不得打「失败：」")
+    assert.match(f.get("#operation-log").textContent, /\[面板\] 首屏已载入本地缓存（3 个账号，1 个账号有上次查询失败）/, "日志只说事实：几个账号、几个有上次失败")
+    if (path === "/api/invite") {
+      assert.match(f.get("#invite-list").innerHTML, /查询失败/, "行内仍要显示上次查询失败")
+      assert.match(f.get("#invite-list").innerHTML, /title="mock rejected"/, "行内要能悬停看到原因")
+    }
   })
 }
+
+test("真正发起刷新且失败仍然报错（别把真失败也吞了）", async () => {
+  const f = await fixture((c) => c.path === "/api/invite-refresh-batch" ? response({ ok: false, error: "mock upstream reject" }, 500) : undefined)
+  await f.get("#invite-refresh").click()
+  await f.settle()
+  assert.equal(f.get("#status").className, "status bad", "真失败必须报错")
+  assert.match(f.get("#operation-log").textContent, /\[邀请码\] 失败：/, "真失败要进日志")
+  assert.equal(f.get("#toast").classList.contains("bad"), true, "真失败要冒 toast")
+})
 
 test("/api/accounts 的缓存失败只作提示，不影响页面状态", async () => {
   const f = await fixture((c) => c.path === "/api/accounts" ? response({ accounts: [{ ...accounts[0], error: "mock rejected", cached: true }] }) : undefined)
@@ -651,4 +667,21 @@ test("批量部分失败和 ok:false 携带 results 仍显示失败状态", asyn
   assert.equal(f.get("#status").className, "status bad")
   assert.match(f.get("#toast").textContent, /成功 1，失败 1/)
   assert.match(f.get("#operation-log").textContent, /mock rejected/)
+})
+
+// ⚠ T-49 P2：保存设置必须**回读服务端**。POST 成功只说明服务端收下了，
+// 不代表已落盘；回读不一致就要明确报错，并用服务端值覆盖界面（不留假象）。
+test("设置保存后回读服务端；回读不一致时报失败并以服务端值为准", async () => {
+  const server = { accountConcurrency: 20, bindConcurrency: 20, routeConcurrency: 2, batchConcurrency: 2, balanceConcurrency: 2, tasksConcurrency: 2, inviteConcurrency: 2, gapMs: 300, autoApply: true, magpiePath: "", batchSkipChecked: true, ledgerReads: 3, focusRefresh: false }
+  const f = await fixture((c) => c.path === "/api/settings" ? response(c.body ? { ok: true, settings: server } : { ok: true, settings: server, defaults: server }) : undefined)
+  await f.input("#setting-tasks-concurrency", "20")
+  await f.get("#setting-tasks-concurrency").emit("change")
+  await f.settle()
+  assert.match(f.get("#settings-status").textContent, /保存失败/, "回读对不上就不得显示「已保存」")
+  assert.match(f.get("#settings-status").textContent, /回读不一致/, "要能看出是回读不一致")
+  assert.equal(f.get("#toast").classList.contains("bad"), true)
+  assert.equal(f.get("#setting-tasks-concurrency").value, "2", "控件要回到服务端值，不留下“已经改了”的假象")
+  const settingsCalls = f.calls.filter((c) => c.path === "/api/settings")
+  assert.ok(settingsCalls.some((c) => c.body && c.body.tasksConcurrency === 20), "必须先发 POST")
+  assert.ok(settingsCalls.some((c) => !c.body && c.body === undefined), "POST 之后必须再 GET 回读")
 })

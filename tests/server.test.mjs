@@ -313,7 +313,9 @@ test("设置默认 20、分别合并持久化且重启保留，不访问上游�
 
 test("设置拒绝非法值、额外字段及非法 JSON，写入失败不改变当前值", async (t) => {
   const f = await fixture(t)
-  for (const body of ["{", null, [], {}, { other: 20 }, { accountConcurrency: 20, accounts: {} }, ...[0, 1.5, "20", true, null].flatMap((value) => [{ accountConcurrency: value }, { bindConcurrency: value }])]) {
+  // ⚠ T-49：未知字段改为**忽略**（不再把整次保存打回 400），但只要一个可识别的键
+  // 都没有，仍然 400（防止拼错键名后“以为存上了”）。所以这里用“全是未知键”的样本。
+  for (const body of ["{", null, [], {}, { other: 20 }, { accounts: {} }, ...[0, 1.5, "20", true, null].flatMap((value) => [{ accountConcurrency: value }, { bindConcurrency: value }])]) {
     assert.equal((await f.raw("POST", "/api/settings", body)).status, 400)
   }
   // 新键的校验（第 17/18 轮新增）：并发必须整数 ≥1，gapMs 0..5000，类型要对
