@@ -100,6 +100,8 @@
 | 24 | 新手任务**全部都显示未完成**，但账号其实早就 8/8 了 | `/onboarding/tasks` 的 `data.tasks` 是**对象**（`{key: true}`），**不是数组**。只认数组会把「8 项全完成」解析成 `{}` ⇒ 界面显示 0/8。⚠ 同级还有 `earned` / `total` 两个数字，不能当任务状态混进来 | `src/points.mjs` 的 `fetchTasks` |
 | 25 | 按钮点了没反应（前端事件绑不上） | HTML 的 `id` 与 JS 的 `$("#id")` 必须逐字对齐。本仓库有一次写成 `bind-start` vs `bind-run`。改完跑一遍 id 对齐检查 | `page/index.html`、`page/assets/app.js` |
 | 26 | 面板说可用号很多，实际能用的就那么几个（routed 号又有模型了） | **置空判定必须排在缓存查询之前**。`catalogOnce` 命中 `loomy-models-cache.json` 会直接返回，判定写在它后面就永远轮不到（真机：281 vs 71）。判据：`tests/models-route-blank.test.mjs` 的 T44-2（先写缓存、再断言 `{}`）；真机核对跑 `node scripts/route-blank-stats.mjs` | `src/hooks/models.mjs`、`scripts/route-blank-stats.mjs` |
+| 27 | 慢号照样被派活 / 面板「刷新速率」把号打挂 | 速率**只从 magpie 自己记的请求**取（`GET /v1/magpie/usage/requests?period=7d&rows=100&provider=loomy`，本机）。三条不许破：① `POST /api/speed/refresh` 是**唯一**取数入口，`config` / `auth.*` 钩子一个都不许调它（启动瞬间会被调几百次）；② `provider.models` 里的跳过判定**零请求**，只读 `<configDir>/loomy-speed-cache.json`；③ 判定看**最近一次**不看平均（20×130 + 1×25 的突发限速，平均值仍≈125 判不出来）。口径与推导在 `src/speed.mjs` 顶部，判据在 `tests/speed*.test.mjs` | `src/speed.mjs`、`src/speed-cache.mjs`、`src/hooks/models.mjs`、`server.mjs` |
+| 28 | 某个模型下的号成批被判「慢」，但这些号实际并不慢 | magpie 的 `usage/requests` 里有 `flow_ms=1` 的异常行（实测 1000 行里 28 条，`out=94/flow_ms=1` → **94000 tok/s**）。它只会让速率**虚高**。B 取中位数挡得住少数离群，但某模型里这种行**过半**时 B 本身会被抬高（实测 `DeepSeek-V4.1-Flash` 34 号、16 个 A>2000、median=48000）⇒ 阈值跟着虚高 ⇒ 正常号被判 slow。所以 B 加了**物理上限** `B_MAX=1000`（真实解码峰值 300–500 tok/s；越过就判该模型「无参考」⇒ 该模型不进 `b`、全员 unknown、一个号都不摘）。**这是 magpie 侧的计时粒度问题，不是我方过滤漏了** —— 别去加行级 `flow_ms` 下限来「修」它 | `src/speed.mjs` 的 `B_MAX` / `buildSpeedTable` |
 
 ---
 

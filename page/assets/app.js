@@ -12,7 +12,9 @@ const state = { accounts: [], tasks: new Map(), invites: new Map(), route: new M
     routeConcurrency: 2, batchConcurrency: 2, balanceConcurrency: 2, tasksConcurrency: 2, inviteConcurrency: 2,
     accountConcurrency: 20, bindConcurrency: 20,
     gapMs: 300, autoApply: true, magpiePath: "",
-    batchSkipChecked: true, ledgerReads: 3, focusRefresh: false, synced: false,
+    batchSkipChecked: true, ledgerReads: 3, focusRefresh: false,
+    // 按速率跳过慢号（默认开，与服务端 `PANEL_SETTINGS_DEFAULTS.speedSkip` 同口径）
+    speedSkip: true, synced: false,
   },
   // 上次已经打过「服务启动于 …」的那个 `since`（同一个进程只打一次，重启才再打）
   serviceLoggedSince: 0,
@@ -23,7 +25,10 @@ const state = { accounts: [], tasks: new Map(), invites: new Map(), route: new M
   // 余额缓存的时间戳（服务端 updatedAt）
   cacheAt: 0,
   // 路由状态的时间戳（服务端 /api/route-state 的 fetchedAt）
-  routeAt: 0 }
+  routeAt: 0,
+  // 速率表（T-62）：服务端缓存的逐 (账号, 模型) 条目 —— 打开面板只读它，
+  // **绝不**触发 `/api/speed/refresh`（那要用户点「刷新速率」）。`at` = 缓存时间戳。
+  speed: { at: 0, b: {}, rows: [] } }
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c])
 const num = (n) => n == null ? "—" : Number(n).toLocaleString("zh-CN")
 
@@ -715,7 +720,7 @@ function renderAccounts() {
   $("#account-summary").textContent = `显示 ${rows.length} / ${state.accounts.length} · 已选 ${state.selected.size}`
   $("#bar-sub").textContent = `${state.accounts.length} 个账号`
   const all = rows.length > 0 && rows.every((a) => state.selected.has(a.uid))
-  $("#accounts-list").innerHTML = `<table><thead><tr><th><input id="select-all" type="checkbox" aria-label="全选筛选结果" ${all ? "checked" : ""}></th><th>#</th><th>手机号</th><th>昵称</th><th>初始化</th><th>任务</th><th>积分</th><th>邀请</th><th>DS4.1 路由</th><th>操作</th></tr></thead><tbody>${visible.map((a, i) => {
+  $("#accounts-list").innerHTML = `<table><thead><tr><th><input id="select-all" type="checkbox" aria-label="全选筛选结果" ${all ? "checked" : ""}></th><th>#</th><th>手机号</th><th>昵称</th><th>初始化</th><th>任务</th><th>积分</th><th>邀请</th><th>DS4.1 路由</th><th>速率</th><th>操作</th></tr></thead><tbody>${visible.map((a, i) => {
     const task = state.tasks.get(a.uid)
     const keys = task?.tasks ? Object.values(task.tasks) : []
     const done = keys.filter(Boolean).length
@@ -724,10 +729,82 @@ function renderAccounts() {
       ? '<span class="muted">未查询</span>'
       : `<span class="quota-inline" title="${esc(task.error || "")}">${badge(`${done}/8`, done >= 8 ? "done" : "")}${task.at ? `<span class="code-usage">截至 ${clock(task.at)}</span>` : ""}${task.error ? '<span class="error">上次失败</span>' : ""}</span>`
     const init = a.firstLogin === true ? badge("已初始化", "done") : a.firstLogin === false ? badge("未初始化", "fail") : badge("未知")
-    return `<tr><td><input type="checkbox" data-select="${esc(a.uid)}" aria-label="选择 ${esc(a.phone || a.name)}" ${state.selected.has(a.uid) ? "checked" : ""}></td><td>${(state.accountPage - 1) * state.accountSize + i + 1}</td><td class="mono">${esc(a.phone || "—")}</td><td title="用户 ID：${esc(a.uid)}">${esc(a.name || "—")}</td><td>${init}</td><td>${taskCell}</td><td>${quota(a)}</td><td>${binding(a.uid)}</td><td>${routeMarkup(a.uid)}</td><td class="row-actions"><button class="tiny" data-row-action="repair-tasks" data-uid="${esc(a.uid)}">补齐任务</button><button class="tiny" data-row-action="row-balance" data-uid="${esc(a.uid)}">查余额</button></td></tr>`
-  }).join("") || '<tr><td colspan="10" class="empty">没有匹配账号；请在宿主供应商页面登录或导入 Loomy 账号。</td></tr>'}</tbody></table>`
+    return `<tr><td><input type="checkbox" data-select="${esc(a.uid)}" aria-label="选择 ${esc(a.phone || a.name)}" ${state.selected.has(a.uid) ? "checked" : ""}></td><td>${(state.accountPage - 1) * state.accountSize + i + 1}</td><td class="mono">${esc(a.phone || "—")}</td><td title="用户 ID：${esc(a.uid)}">${esc(a.name || "—")}</td><td>${init}</td><td>${taskCell}</td><td>${quota(a)}</td><td>${binding(a.uid)}</td><td>${routeMarkup(a.uid)}</td><td>${speedMarkup(a)}</td><td class="row-actions"><button class="tiny" data-row-action="repair-tasks" data-uid="${esc(a.uid)}">补齐任务</button><button class="tiny" data-row-action="row-balance" data-uid="${esc(a.uid)}">查余额</button></td></tr>`
+  }).join("") || '<tr><td colspan="11" class="empty">没有匹配账号；请在宿主供应商页面登录或导入 Loomy 账号。</td></tr>'}</tbody></table>`
   const selectAll = $("#select-all")
   selectAll.indeterminate = !all && rows.some((a) => state.selected.has(a.uid))
+}
+
+// ── 速率（T-62）：只读缓存，打开面板不产生任何请求 ──────────────────────
+//
+// ⚠ 这里**只有** `GET /api/speed`（服务端只读 `<configDir>/loomy-speed-cache.json`）。
+//    `POST /api/speed/refresh` 只能由用户点「刷新速率」触发 —— 那个接口会去读
+//    magpie 的 usage/requests。打开面板自动刷新就是用户明确要关掉的那件事。
+
+/**
+ * 读速率表。失败**不抛**：速率是附加信息，读不到就让这一列显示 `—`，
+ * 不许把首屏（账号表）一起拖垮 —— 旧进程还没有这个接口时就会走到这里。
+ */
+async function speeds() {
+  try {
+    const result = await api("/api/speed")
+    state.speed = {
+      at: Number(result.updatedAt) || 0,
+      b: result.b && typeof result.b === "object" ? result.b : {},
+      rows: Array.isArray(result.accounts) ? result.accounts : [],
+    }
+  } catch (e) {
+    state.speed = { at: 0, b: {}, rows: [] }
+    // ⚠ 文案刻意不用「失败：」开头：首屏日志已有「失败：」这条前缀的断言，
+    //   而「读不到速率表」根本不影响账号表 —— 那不该被读成一次失败操作。
+    log("速率", `速率表未读到：${e.message}（不影响账号表）`)
+  }
+}
+
+/**
+ * 这个账号的速率条目。
+ *
+ * 表是**按 (账号, 模型)** 记的，而账号表是**按账号**一行 —— 所以取它
+ * **调用次数最多**的那条（= 它平时真正在跑的模型）。次数相同则保留先出现的那条。
+ *
+ * 账号键用 `phone` / `name`：服务端 `listAccounts` 的 `phone` 就是
+ * `plugin-auth.json` 的 `metadata.phone`，而 magpie usage 的 `providerAccount`
+ * 是同一个值（手机号，有些号是打码形态 `138****6740`，两边一致）。
+ */
+function speedEntryOf(a) {
+  const keys = [a?.phone, a?.name].map((v) => String(v ?? "").trim()).filter(Boolean)
+  if (keys.length === 0) return null
+  let best = null
+  for (const row of state.speed.rows) {
+    if (!keys.includes(String(row?.account ?? "").trim())) continue
+    if (!best || Number(row.calls) > Number(best.calls)) best = row
+  }
+  return best
+}
+
+/**
+ * 「速率」列：normal → `126.5 tok/s`；slow → 红字 `24.0 tok/s ⚠️已跳过`；
+ * unknown（含没有缓存）→ `—`。
+ *
+ * 「已跳过」只说明**这个号在这个模型上**让位了 —— 别的模型它照旧接活，
+ * 所以 tooltip 里写清是哪个模型、什么时候、样本多少。
+ */
+function speedMarkup(a) {
+  const entry = speedEntryOf(a)
+  if (!entry || entry.verdict === "unknown" || entry.lastSpeed == null || !Number.isFinite(Number(entry.lastSpeed))) {
+    return '<span class="muted" title="没有可用的速率记录（缓存为空 / 记录超过 3 天 / 这个模型还没有中位数）">—</span>'
+  }
+  const rate = `${Number(entry.lastSpeed).toFixed(1)} tok/s`
+  const mid = Number(state.speed.b?.[entry.model])
+  const detail = [
+    `模型 ${entry.model}`,
+    `最近一次 ${clock(entry.lastAt) || "—"}`,
+    `样本 ${num(entry.calls)} 次`,
+    Number.isFinite(mid) ? `该模型中位数 ${mid.toFixed(1)} tok/s` : "",
+    entry.verdict === "slow" ? "低于中位数×0.7 ⇒ 有别的号能接时这个号不报该模型" : "",
+  ].filter(Boolean).join(" · ")
+  if (entry.verdict === "slow") return `<span class="error" title="${esc(detail)}">${esc(rate)} ⚠️已跳过</span>`
+  return `<span title="${esc(detail)}">${esc(rate)}</span>`
 }
 
 function isCodeExhausted(c) {
@@ -770,7 +847,7 @@ function render() {
   $$("[data-route-check]").forEach((b) => { b.disabled = state.busy || state.batch.running })
   // 刷新任务进行中：刷新入口一律禁用（避免重复触发、重复扣积分）
   const running = state.batch.running || jobRunning()
-  $$("#account-balance, #account-tasks, #invite-refresh, #usage-refresh").forEach((b) => { b.disabled = state.busy || running })
+  $$("#account-balance, #account-tasks, #invite-refresh, #usage-refresh, #speed-refresh").forEach((b) => { b.disabled = state.busy || running })
   // 「重新检测不健康账号」一次会真打 200+ 次模型请求：跑到一半再点一次 =
   // 同一批号被并发检测两遍，白扣积分还可能被上游限流。所以只要批量在跑就禁用。
   const recheck = $("#route-recheck-unhealthy")
@@ -876,6 +953,8 @@ async function loadSettings() {
       ledgerReads: Number(settings.ledgerReads) || 3,
       // 严格 `=== true`：字段缺失 / 旧服务端 → 关（宁可不动，也不偷偷重读）
       focusRefresh: settings.focusRefresh === true,
+      // 反过来：字段缺失 → **开**（默认按速率跳过慢号；关掉要显式 false）
+      speedSkip: settings.speedSkip !== false,
     }
     for (const [key, selector] of Object.entries(concurrencyFields)) {
       const value = settings[key] === undefined ? 20 : settings[key]
@@ -1034,6 +1113,19 @@ $("#route-refresh").addEventListener("click", () => busy(async () => {
   await routeStates()
   log("路由", `路由状态已刷新，共 ${state.route.size} 条记录`)
 }, "路由"))
+// 速率：**唯一**会去读 magpie 的 usage/requests 的按钮（T-62）。
+//
+// ⚠ 它打的是**本机网关**（`http://127.0.0.1:3425/v1/magpie/usage/requests`），
+//    不是上游；上游一次都不碰。打开面板不会走这里（只读 `/api/speed`）。
+// ⚠ `truncated` 必须说出来：被页数上限截断时用户看到的是「少算了一半的号」，
+//    静默吞掉就是「明明刷新了，那个慢号怎么还在接活」。
+$("#speed-refresh")?.addEventListener("click", () => busy(async () => {
+  const result = await api("/api/speed/refresh", {})
+  await speeds()
+  render()
+  const cut = result.truncated === true ? `（已截断，只取了前 ${num(result.rows)} 条）` : ""
+  log("速率", `速率已更新：${num(result.rows)} 行 / ${num(result.models)} 个模型 / ${num(result.slow)} 个慢号${cut}`)
+}, "速率"))
 $("#logs-clear").addEventListener("click", () => { logEntries.length = 0; renderLogs() })
 $("#logs-copy").addEventListener("click", async () => {
   if (!logEntries.length) return toast("暂无日志可复制")
@@ -1395,6 +1487,8 @@ function syncSettingsFields() {
   if (magpiePath) magpiePath.value = String(state.panel.magpiePath ?? "")
   const focusRefresh = $("#setting-focus-refresh")
   if (focusRefresh) focusRefresh.checked = state.panel.focusRefresh === true
+  const speedSkip = $("#setting-speed-skip")
+  if (speedSkip) speedSkip.checked = state.panel.speedSkip !== false
 }
 
 /** 把服务端返回的设置并进 `state.panel`（loadSettings / saveSetting 共用口径）。 */
@@ -1415,6 +1509,8 @@ function mergePanelSettings(settings) {
     ledgerReads: Number(settings.ledgerReads) || state.panel.ledgerReads,
     accountConcurrency: Number(settings.accountConcurrency) || state.panel.accountConcurrency,
     bindConcurrency: Number(settings.bindConcurrency) || state.panel.bindConcurrency,
+    // 默认开：字段缺失（旧服务端）不该把慢号突然全放回来
+    speedSkip: settings.speedSkip === undefined ? state.panel.speedSkip : settings.speedSkip !== false,
   }
 }
 
@@ -1473,6 +1569,7 @@ numberSetting("#setting-gap-ms", 0, 5000, "gapMs")
 numberSetting("#setting-ledger-reads", 1, 5, "ledgerReads")
 $("#setting-batch-skip")?.addEventListener("change", (e) => { void saveSetting({ batchSkipChecked: e.target.checked === true }) })
 $("#setting-focus-refresh")?.addEventListener("change", (e) => { void saveSetting({ focusRefresh: e.target.checked === true }) })
+$("#setting-speed-skip")?.addEventListener("change", (e) => { void saveSetting({ speedSkip: e.target.checked === true }) })
 $("#setting-auto-apply")?.addEventListener("change", (e) => { void saveSetting({ autoApply: e.target.checked === true }) })
 $("#setting-magpie-path")?.addEventListener("change", (e) => { void saveSetting({ magpiePath: String(e.target.value ?? "").trim() }) })
 // 「只看被限制」：纯前端筛选，不发请求
@@ -1493,6 +1590,9 @@ $("#route-batch-hint")?.addEventListener("click", () => {
 async function loadInitial() {
   await busy(async () => {
     await balances()
+    // 速率列：`GET /api/speed` 只读本地缓存（**零请求**），不触发 refresh。
+    // 放在 render() 之前，账号表第一次画出来就带上速率这一列。
+    await speeds()
     render()
     await queries([tasks(), invites(), routeStates()])
     const loaded = state.accounts.length

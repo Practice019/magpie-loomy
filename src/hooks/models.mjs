@@ -73,6 +73,8 @@ import { modelsAuth } from "./../auth-headers.mjs"
 import { parseNameMultiplier } from "../multipliers.mjs"
 import { availableModels, IMAGE_MODEL_IDS } from "../models.mjs"
 import { readCachedModels, writeModelsCache } from "../models-cache.mjs"
+import { MIN_FAST, SLOW_RATIO } from "../speed.mjs"
+import { readSpeedCache } from "../speed-cache.mjs"
 // 路由判定的读取器官在 loader（它是 `accountKeys`/`accountRoute` 的所有者）。
 // 依赖方向：hooks/models → hooks/loader → src/{prepare-body,upstream-facts}，
 // 没有回边，也不会反向摸到 index.mjs。
@@ -157,11 +159,21 @@ function logOnce(log, kind, key, message) {
  * 构建 `provider.models` 钩子。
  *
  * @param {{baseUrl?: string, fetchImpl?: typeof fetch, log?: {warn: Function},
- *   configDir?: string, routeStore?: any, routeCheck?: boolean}} [opts]
+ *   configDir?: string, routeStore?: any, routeCheck?: boolean|Function,
+ *   speedSkip?: boolean|Function}} [opts]
  *   `configDir` / `routeStore`：读「这个账号是不是被上游限制了」。
  *   `routeCheck`：界面开关 `routecheck`（默认 **开**）。关掉 = `routed` 不再置空目录，
  *   账号会继续被派活（付 2× 拿降级模型）。`expired` / `exhausted` **不受影响**——
  *   那两个不是"上游把号换掉了"，是"这个号自己坏了"，继续派活只会白刷 401/402。
+ *
+ *   `speedSkip`（T-62）：界面开关 `speedskip`（默认 **开**）。按
+ *   `<configDir>/loomy-speed-cache.json` 里**最近一次**速率判定：这个号在这个模型上
+ *   偏慢（`< B × 0.7`）且该模型下还有 ≥ `MIN_FAST` 个非慢号 ⇒ **不报这个模型**。
+ *   规则与真源见 `src/speed.mjs` 顶部；本钩子**一个请求都不发**（只读缓存文件）。
+ *   缓存缺失 / 损坏 / 开关关闭 ⇒ 完全退回原行为。
+ *
+ *   ⚠ 与 `routeCheck` 同理：生产必须传**函数**（惰性读），否则工厂期读到的是
+ *   「未声明的键 = false」（见 index.mjs 里 `routeCheckNow` 的注释）。
  * @returns {(provider: any, ctx?: {auth?: any}) => Promise<Record<string, object>>}
  */
 export function makeModelsHook(opts = {}) {
@@ -177,6 +189,9 @@ export function makeModelsHook(opts = {}) {
   // 全部模型，可用号虚高（见 index.mjs 里 `routeCheckNow` 的注释）。
   const routeCheckOf =
     typeof opts.routeCheck === "function" ? opts.routeCheck : () => opts.routeCheck !== false
+  // `speedSkip` 同口径：缺省为开（`undefined !== false`），函数则每次调用现读。
+  const speedSkipOf =
+    typeof opts.speedSkip === "function" ? opts.speedSkip : () => opts.speedSkip !== false
 
   return async function models(provider, ctx = {}) {
     const auth = ctx?.auth
@@ -240,14 +255,148 @@ export function makeModelsHook(opts = {}) {
         fetchImpl: doFetch,
         log,
       })
-      if (!live || live.length === 0) return toMagpieModels(provider, staticEntries())
-      return toMagpieModels(provider, live.map(withMultiplier))
+      const listed = !live || live.length === 0
+        ? toMagpieModels(provider, staticEntries())
+        : toMagpieModels(provider, live.map(withMultiplier))
+      // ── ② 慢号让位（零请求，只读 `<configDir>/loomy-speed-cache.json`）──
+      //
+      // 放在**这里**（目录已经算出、还没返回）而不是前面：目录是 provider 级的，
+      // 要不要摘模型是**账号级**的判断，两者只有在这一步才同时具备。
+      // 排在置空判定之后是刻意的：整号坏（expired/exhausted/routed）比「这个模型慢」
+      // 更严重，日志与结论都该先说整号的事。
+      return applySpeedSkip(listed, { auth, configDir, log, enabled: speedSkipOf() })
     } catch (e) {
       // ⚠ 不抛：抛了宿主也只会保留旧列表，但日志里就没有线索了。
       log.warn?.(`loomy: 拉取实时模型目录失败，回退静态表: ${e?.message ?? e}`)
-      return toMagpieModels(provider, staticEntries())
+      return applySpeedSkip(toMagpieModels(provider, staticEntries()), {
+        auth,
+        configDir,
+        log,
+        enabled: speedSkipOf(),
+      })
     }
   }
+}
+
+/**
+ * 这个账号在**速率表**里的候选键（按可靠性排序，去重且非空）。
+ *
+ * # 对齐依据（实测，不是猜的）
+ *
+ * magpie 的 usage/requests 每行都有 `providerAccount`：
+ *
+ *	{"provider":"loomy","host":"loomy as 16540492083","providerAccount":"16540492083",…}
+ *
+ * 而 `<configDir>/plugin-auth.json` 里对应的账号是：
+ *
+ *	{"accountId":"16540492083","metadata":{"phone":"16540492083","nickname":"16540492083"},…}
+ *
+ * ⇒ **`providerAccount` 就是 `auth.accountId`**（同一个手机号；有些号上游给的是
+ * 打码形态 `138****6740`，两边也一致）。所以 `accountId` 排第一。
+ *
+ * 后面几个是**兜底**（教训来自 `accountKeys()`：曾经「文件里存 uid、钩子里查
+ * accountId」⇒ 永远 miss ⇒ 整个功能静默失效）。这里同理按顺序全试一遍：
+ * `metadata.phone` → `metadata.nickname` → `uid` → `metadata.uid`。
+ * 只要有一个键在表里命中，就按它判 —— 命中哪个都写在日志里，排障能看出来。
+ *
+ * @param {any} auth
+ * @returns {string[]}
+ */
+export function speedAccountKeys(auth) {
+  /** @type {string[]} */
+  const out = []
+  for (const raw of [
+    auth?.accountId,
+    auth?.metadata?.phone,
+    auth?.metadata?.nickname,
+    auth?.uid,
+    auth?.metadata?.uid,
+    auth?.metadata?.userId,
+  ]) {
+    if (raw === null || raw === undefined) continue
+    const value = String(raw).trim()
+    if (!value || out.includes(value)) continue
+    out.push(value)
+  }
+  return out
+}
+
+/**
+ * 按速率表摘掉「这个号偏慢、但该模型还有别人能接」的模型。
+ *
+ * # 判据（三条，缺一不可）
+ *
+ *	① 这个账号在该模型上的 `verdict === "slow"`（最近一次 < B × 0.7，
+ *	   且记录不超过 STALE_DAYS —— 过期就是 unknown，见 src/speed.mjs）
+ *	② 该模型下还有 ≥ `MIN_FAST` 个**非 slow** 账号
+ *	③ 开关 `speedSkip` 打开、缓存可读
+ *
+ * ② 是「让位」而不是「封杀」：一个模型下所有号都慢时，摘掉它等于自己砍掉这个
+ * 模型（路由会拿 `{}` 当「该号无模型」），所以全慢时一律放回来。
+ *
+ * unknown **不跳**：「未验证」≠「不可用」（与 routed 那条判定的取舍同源）。
+ *
+ * @param {Record<string, any>} models `toMagpieModels` 的产物
+ * @param {{auth: any, configDir: string, log: any, enabled: boolean}} opts
+ * @returns {Record<string, any>}
+ */
+function applySpeedSkip(models, opts) {
+  if (opts.enabled === false) return models
+  const table = readSpeedCache(opts.configDir)
+  // 没有缓存 ⇒ 完全原行为（不抛、不记日志、不猜）
+  if (!table) return models
+  const keys = speedAccountKeys(opts.auth)
+  if (keys.length === 0) return models
+
+  // 每个模型下「非 slow」的账号数（unknown 也算能接：它不在判定里）
+  /** @type {Map<string, number>} */
+  const fast = new Map()
+  for (const entry of Object.values(table.accounts)) {
+    if (!entry || entry.verdict === "slow") continue
+    fast.set(entry.model, (fast.get(entry.model) ?? 0) + 1)
+  }
+
+  /** @type {Record<string, any>} */
+  const kept = {}
+  /** @type {string[]} */
+  const skipped = []
+  let hitKey = ""
+  for (const [id, model] of Object.entries(models)) {
+    const mine = lookupSpeed(table.accounts, id, keys)
+    if (mine && mine.entry.verdict === "slow" && (fast.get(id) ?? 0) >= MIN_FAST) {
+      skipped.push(id)
+      hitKey = hitKey || mine.key
+      continue
+    }
+    kept[id] = model
+  }
+
+  if (skipped.length > 0) {
+    logOnce(
+      opts.log,
+      "speedslow",
+      hitKey,
+      `loomy: 账号 ${hitKey} 偏慢（最近一次 < 中位数 × ${SLOW_RATIO}），` +
+        `且有别的号能接，暂不报 ${skipped.join(" / ")}`,
+    )
+  }
+  return kept
+}
+
+/**
+ * 在速率表里找「这个账号 × 这个模型」的条目（按候选键顺序，第一个命中就用）。
+ *
+ * @param {Record<string, any>} accounts `table.accounts`
+ * @param {string} model 模型的 id（= 目录里的键）
+ * @param {string[]} keys `speedAccountKeys()` 的结果
+ * @returns {{entry: any, key: string}|null}
+ */
+function lookupSpeed(accounts, model, keys) {
+  for (const key of keys) {
+    const hit = accounts[`${model}|${key}`]
+    if (hit && typeof hit === "object") return { entry: hit, key }
+  }
+  return null
 }
 
 /**

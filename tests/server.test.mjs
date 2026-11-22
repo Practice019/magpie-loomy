@@ -31,6 +31,8 @@ const EXPECTED_SETTINGS = Object.freeze({
   ledgerReads: 3,
   // T-35：切回窗口自动重读，**默认关**（用户要求「禁止自动刷新」）
   focusRefresh: false,
+  // T-62：按速率跳过慢号，**默认开**（与供应商页的 `speedskip` 同口径）
+  speedSkip: true,
 })
 
 /** 只有 legacy 两项变了（并发两键的合并测试里用）。 */

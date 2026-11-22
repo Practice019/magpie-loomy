@@ -57,7 +57,7 @@ async function fixture(t) {
 /** 面板设置文件的完整期望键（与 server.mjs 的 PANEL_SETTINGS_DEFAULTS 同形状）。 */
 const PANEL_KEYS = [
   "routeConcurrency", "batchConcurrency", "balanceConcurrency", "tasksConcurrency", "inviteConcurrency",
-  "gapMs", "autoApply", "magpiePath", "batchSkipChecked", "ledgerReads", "focusRefresh",
+  "gapMs", "autoApply", "magpiePath", "batchSkipChecked", "ledgerReads", "focusRefresh", "speedSkip",
 ]
 
 /**
@@ -75,6 +75,7 @@ const FIELDS = [
   { id: "#setting-batch-skip", key: "batchSkipChecked", file: "panel", value: false },
   { id: "#setting-ledger-reads", key: "ledgerReads", file: "panel", value: 5 },
   { id: "#setting-focus-refresh", key: "focusRefresh", file: "panel", value: true },
+  { id: "#setting-speed-skip", key: "speedSkip", file: "panel", value: false },
   { id: "#setting-account-concurrency", key: "accountConcurrency", file: "state", value: 33 },
   { id: "#bind-conc", key: "bindConcurrency", file: "state", value: 44 },
 ]

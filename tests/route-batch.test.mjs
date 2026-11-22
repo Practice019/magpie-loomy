@@ -302,6 +302,8 @@ test("设置：默认值、非法值不写盘、合法值落盘", async (t) => {
     batchSkipChecked: true,
     ledgerReads: 3,
     focusRefresh: false,
+    // T-62：按速率跳过慢号，默认开
+    speedSkip: true,
   })
   assert.equal((await f.call("POST", "/api/settings", { batchConcurrency: 0 })).status, 400)
   // 新键同样要挡住非法值（第 17/18 轮新增：每类并发、gapMs、autoApply、magpiePath）
