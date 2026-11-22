@@ -55,6 +55,8 @@ import { readLocalAuth, readLocalPoints, defaultClientStoreDir } from "./src/cli
 import { usageFromPoints, tasksSummary, DAILY_RESET_AMOUNT } from "./src/usage.mjs"
 import { USAGE_CACHE_FILE, usageCacheEntry } from "./src/quota-cache.mjs"
 import { makeRateGate, RATE_GATE_CAPACITY, RATE_GATE_REFILL_MS } from "./src/rate-gate.mjs"
+import { buildSpeedTable } from "./src/speed.mjs"
+import { readSpeedCache, writeSpeedCache } from "./src/speed-cache.mjs"
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 
@@ -322,6 +324,9 @@ async function handle(req, res, ctx) {
   if (path === "/api/invite/pool/scan" && req.method === "GET") return readInviteJob(res, ctx, url.searchParams, "scan")
   if (path === "/api/invite/assign" && req.method === "POST") return inviteAssignStart(req, res, ctx)
   if (path === "/api/invite/assign" && req.method === "GET") return readInviteJob(res, ctx, url.searchParams, "assign")
+  // 速率分档（T-62）：refresh 是**唯一**打 magpie 的地方；GET 只读缓存、零请求
+  if (path === "/api/speed" && req.method === "GET") return sendJson(res, 200, speedState(ctx))
+  if (path === "/api/speed/refresh" && req.method === "POST") return speedRefresh(req, res, ctx)
 
   sendJson(res, 404, { error: "not found" })
 }
@@ -1702,6 +1707,227 @@ function readUsageCacheTable(configDir) {
   return readKeyedCache(configDir, USAGE_CACHE_FILE, "accounts")
 }
 
+// ── 速率分档（T-62） ────────────────────────────────────────────────────
+//
+// # 数据只有一条来源：magpie 自己记的逐次请求
+//
+//	GET http://<gateway>/v1/magpie/usage/requests?period=7d&rows=100&provider=loomy&offset=N
+//
+// 这是**本机**请求（网关就是 magpie 进程本身），不碰上游。速率口径的推导与
+// 「为什么看最近一次而不是平均」全在 `src/speed.mjs` 顶部，本文件只负责取数与落盘。
+//
+// # 三条硬规矩
+//
+//	① `POST /api/speed/refresh` 是**唯一**打 magpie 的地方。`config` / `auth.*`
+//	   钩子一个都不许调它（钩子在 magpie 的主机里跑，启动瞬间会被调几百次）。
+//	② `GET /api/speed` **零请求**：只读 `<configDir>/loomy-speed-cache.json`。
+//	   面板打开时只走它 —— 打开面板不许产生任何上游/网关流量。
+//	③ 失败**不写缓存**：一份算坏的表会让「跳过慢号」按错误的结论摘模型。
+//
+// # 分页
+//
+// 实测 `rows=500` 也只回 100 条（服务端分页上限），响应里带 `offset` 与 `total`。
+// 所以这里固定 `rows=100` 按 offset 翻页，并且**有页数上限**（默认 10 页 = 1000 条）：
+// 没有上限的循环会在 `total` 报错时变成死循环。
+
+/** magpie 的用量查询端点（唯一允许被 `speedRefresh` 命中的路径）。 */
+const SPEED_USAGE_PATH = "/v1/magpie/usage/requests"
+
+/** 每页行数（实测服务端上限就是 100，写大了也只会回 100）。 */
+export const SPEED_PAGE_ROWS = 100
+
+/**
+ * 最多翻几页（20 × 100 = 2000 条）。
+ *
+ * 实测口径：7d 窗口的 loomy `total` ≈ **1436**（2026-11-22，1000 行采样时 total 报 1436），
+ * 取 20 页 = 2000 条，留了一倍余量。上限的意义是**防无边界循环**（`total` 报错时
+ * 不能一直翻下去），不是「够用就行」。
+ *
+ * ⚠ 如果以后 loomy 的请求量翻倍、20 页也不够，`refresh` 的返回会带 `truncated: true`
+ * 并且面板日志多一句「（已截断，只取了前 N 条）」—— **看见它就调大这个数**。
+ */
+export const SPEED_MAX_PAGES = 20
+
+/** 单页超时（本机请求，不该慢；慢说明网关在忙，交给用户重试）。 */
+const SPEED_TIMEOUT_MS = 20_000
+
+/** 网关的默认地址（`gateway.json` 缺失 / 损坏 / 没 addr 时用它）。 */
+export const DEFAULT_GATEWAY_ADDR = "127.0.0.1:3425"
+
+/**
+ * 读 `<configDir>/gateway.json` 里的 `addr`。
+ *
+ * 实测形态：`{"addr":"[::]:3425","pid":51800,"serves":"app","version":"0.1.4634"}`。
+ * 读不出来一律回落 {@link DEFAULT_GATEWAY_ADDR}（面板不该因为读不到网关地址就整页报错）。
+ *
+ * @param {string} [configDir]
+ * @returns {string}
+ */
+export function gatewayAddr(configDir) {
+  const dir = String(configDir ?? "").trim()
+  if (!dir) return DEFAULT_GATEWAY_ADDR
+  try {
+    /** @type {any} */
+    const parsed = JSON.parse(readFileSync(join(dir, "gateway.json"), "utf8"))
+    const addr = String(parsed?.addr ?? "").trim()
+    return addr || DEFAULT_GATEWAY_ADDR
+  } catch {
+    return DEFAULT_GATEWAY_ADDR
+  }
+}
+
+/**
+ * 把 `gateway.json` 的 `addr` 归一成能直接连的基址。
+ *
+ *	"[::]:3425"       → http://127.0.0.1:3425   （IPv6 通配地址不能当 host 用）
+ *	"0.0.0.0:3425"    → http://127.0.0.1:3425
+ *	"127.0.0.1:3425"  → http://127.0.0.1:3425
+ *	":3425" / "3425"  → http://127.0.0.1:3425
+ *	"[::1]:3425"      → http://[::1]:3425       （真回环，保留）
+ *
+ * @param {string} [addr]
+ * @returns {string} 末尾没有斜杠
+ */
+export function gatewayBaseUrl(addr) {
+  const raw = String(addr ?? "").trim().replace(/^https?:\/\//i, "").replace(/\/+$/, "") || DEFAULT_GATEWAY_ADDR
+  /** @type {string} */
+  let host = ""
+  /** @type {string} */
+  let port = ""
+  if (raw.startsWith("[")) {
+    const end = raw.indexOf("]")
+    host = end > 0 ? raw.slice(0, end + 1) : ""
+    port = end > 0 ? raw.slice(end + 1).replace(/^:/, "") : ""
+  } else if (raw.includes(":")) {
+    const idx = raw.lastIndexOf(":")
+    host = raw.slice(0, idx)
+    port = raw.slice(idx + 1)
+  } else {
+    port = raw.replace(/^:/, "")
+  }
+  const connectHost =
+    host === "" || host === "[::]" || host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host
+  const connectPort = /^\d+$/.test(port) && Number(port) > 0 && Number(port) < 65536 ? port : "3425"
+  return `http://${connectHost}:${connectPort}`
+}
+
+/**
+ * `GET /api/speed`：只读缓存，**零请求**。
+ *
+ * 返回 `{ ok, updatedAt, b, accounts: [{model, account, lastSpeed, calls, verdict, lastAt}] }`。
+ * 没有缓存时给空表（面板据此显示 `—`），不报错、不触发刷新。
+ *
+ * @param {any} ctx
+ */
+function speedState(ctx) {
+  const table = readSpeedCache(ctx.configDir)
+  if (!table) return { ok: true, updatedAt: 0, b: {}, accounts: [] }
+  return {
+    ok: true,
+    updatedAt: table.updatedAt,
+    b: table.b,
+    accounts: Object.values(table.accounts).map((e) => ({
+      model: e.model,
+      account: e.account,
+      lastSpeed: e.lastSpeed,
+      calls: e.calls,
+      verdict: e.verdict,
+      lastAt: e.lastAt,
+    })),
+  }
+}
+
+/**
+ * `POST /api/speed/refresh`：翻页读 magpie 的 usage/requests → 算表 → 原子落盘。
+ *
+ * 返回 `{ ok, rows, models, accounts, slow, b, total, truncated }`（面板日志就是用它
+ * 拼一句话）。`truncated = rows < total` —— 翻了 {@link SPEED_MAX_PAGES} 页还没拿够，
+ * 说明这批数据被截断了：**面板会明说「已截断」**，不要静默少算。
+ *
+ * @param {import("node:http").IncomingMessage} req
+ * @param {import("node:http").ServerResponse} res
+ * @param {any} ctx
+ */
+async function speedRefresh(req, res, ctx) {
+  // 本接口不收参数（period 只支持 7d/30d，按用户拍板固定 7d）；把 body 丢掉，
+  // 免得 keep-alive 连接上残留一段没读完的请求体。
+  req.resume?.()
+  if (!ctx.configDir) return sendJson(res, 503, { ok: false, error: "未设置 configDir，无法保存速率缓存" })
+
+  /** @type {{rows: any[], total: number}} */
+  let fetched
+  try {
+    fetched = await fetchSpeedRows(ctx)
+  } catch (e) {
+    // 失败不写缓存：宁可让面板继续显示上一份（或空表），也不留半份算坏的表
+    return sendJson(res, 502, {
+      ok: false,
+      error: `读取 magpie usage/requests 失败：${String(e?.message ?? e).replace(/\s+/g, " ").trim().slice(0, 200)}`,
+    })
+  }
+
+  const rows = fetched.rows
+  const table = buildSpeedTable(rows, { now: Date.now() })
+  const wrote = writeSpeedCache(ctx.configDir, table)
+  if (!wrote.ok) ctx.log?.warn?.(`loomy panel: ${wrote.error}`)
+  const entries = Object.values(table.accounts)
+  return sendJson(res, 200, {
+    ok: true,
+    rows: rows.length,
+    models: Object.keys(table.b).length,
+    accounts: entries.length,
+    slow: entries.filter((e) => e.verdict === "slow").length,
+    b: table.b,
+    updatedAt: table.updatedAt,
+    // 网关报的窗口总量 vs 实际拿到：`rows < total` 就是被页数上限截断了
+    total: fetched.total,
+    truncated: fetched.total > 0 && rows.length < fetched.total,
+    ...(wrote.ok ? {} : { warning: wrote.error }),
+  })
+}
+
+/**
+ * 按 offset 翻页读 magpie 的 usage/requests（**唯一**打网关的地方）。
+ *
+ * 停止条件（三条，任一成立就停）：
+ *
+ *	· 这一页是空的
+ *	· 已经拿够 `total`
+ *	· 这一页不足 {@link SPEED_PAGE_ROWS}（最后一页）
+ *
+ * 另有页数上限 {@link SPEED_MAX_PAGES}。`total` 只用于「够了就停」，
+ * 不用于「还差多少就继续」—— `total` 会随新请求增长，靠它会追不上。
+ *
+ * @param {any} ctx
+ * @returns {Promise<{rows: any[], total: number}>} `total` 是网关报的窗口总量
+ *   （0 = 网关没报）；调用方据此判断这批数据是否被页数上限截断。
+ */
+async function fetchSpeedRows(ctx) {
+  const base = gatewayBaseUrl(gatewayAddr(ctx.configDir))
+  /** @type {any[]} */
+  const rows = []
+  let total = 0
+  for (let page = 0; page < SPEED_MAX_PAGES; page += 1) {
+    const offset = page * SPEED_PAGE_ROWS
+    const url = `${base}${SPEED_USAGE_PATH}?period=7d&rows=${SPEED_PAGE_ROWS}&provider=${PROVIDER}&offset=${offset}`
+    const resp = await ctx.fetchImpl(url, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+      signal: AbortSignal.timeout(SPEED_TIMEOUT_MS),
+    })
+    if (!resp?.ok) throw new Error(`HTTP ${resp?.status ?? "?"}`)
+    /** @type {any} */
+    const parsed = await resp.json()
+    const batch = Array.isArray(parsed?.rows) ? parsed.rows : []
+    total = Number(parsed?.total) || total
+    for (const row of batch) rows.push(row)
+    if (batch.length === 0) break
+    if (total > 0 && rows.length >= total) break
+    if (batch.length < SPEED_PAGE_ROWS) break
+  }
+  return { rows, total }
+}
+
 /**
  * `POST /api/accounts-refresh {uid}` → **也走刷新任务**（1 个 uid 的 job）。
  *
@@ -2675,6 +2901,11 @@ export const PANEL_SETTINGS_DEFAULTS = Object.freeze({
   // 切回窗口时是否重读本地缓存。**默认关**：用户原话「禁止自动刷新，因为发请求都有风险」——
   // 即使那 5 个 GET 只读本地缓存、绝不触发上游，开关也必须由用户自己决定。
   focusRefresh: false,
+  // 按速率跳过慢号（T-62）：**默认开**。关掉 = `provider.models` 完全按原样报
+  // （慢号照旧接活）。与 magpie 供应商页的 `speedskip` 是同一条判定的两个闸门，
+  // 两个都开才生效 —— 面板这个是运行时总闸（改完下一次钩子调用即生效），
+  // 供应商页那个是发布级开关（见 index.mjs 的 `speedSkipNow`）。
+  speedSkip: true,
 })
 
 const SETTINGS_FILE = "loomy-panel-settings.json"
@@ -2753,6 +2984,8 @@ function validPanelSetting(key, value) {
   if (key === "batchSkipChecked") return typeof value === "boolean"
   if (key === "ledgerReads") return Number.isInteger(value) && value >= 1 && value <= 5
   if (key === "focusRefresh") return typeof value === "boolean"
+  // T-62：按速率跳过慢号。读侧见 `src/speed-cache.mjs` 的 `readSpeedSkipSetting`。
+  if (key === "speedSkip") return typeof value === "boolean"
   return false
 }
 
@@ -2852,6 +3085,7 @@ async function savePanelSettings(req, res, ctx) {
   "autoApply",
   "magpiePath",
   "focusRefresh",
+  "speedSkip",
 ]
   if (!isPlainObject(input) || !Object.keys(input).length) {
     return sendJson(res, 400, { error: `仅接受 ${accepted.join("/")}，值必须合法` })

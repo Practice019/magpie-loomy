@@ -45,6 +45,7 @@ import { makeLoaderHook } from "./src/hooks/loader.mjs"
 import { makeUsageHook } from "./src/hooks/usage.mjs"
 import { makeModelsHook } from "./src/hooks/models.mjs"
 import { makeImportHook } from "./src/importer.mjs"
+import { readSpeedSkipSetting } from "./src/speed-cache.mjs"
 
 const { default: manifest } = await import("./package.json", { with: { type: "json" } })
 const ICON = manifest.magpie.icon
@@ -137,6 +138,21 @@ export const AUTH_OPTIONS = Object.freeze([
     default: true,
     filtersModels: true,
   },
+  {
+    key: "speedskip",
+    label: "按速率跳过慢号",
+    description:
+      "用 magpie 自己记录的逐次请求算每个号在每个模型上的速率（最近一次 < 该模型中位数 × 0.7 = 慢号）。" +
+      "该模型下还有别的号能接时，慢号不报这个模型，路由就不给它派这个模型的活。" +
+      "数据全部来自面板「刷新速率」，钩子里零请求。关闭 = 慢号照旧接活。",
+    labels: { zh: "按速率跳过慢号", en: "Skip slow accounts by measured speed" },
+    descriptions: {
+      zh: "用 magpie 自己记录的请求算速率：最近一次 < 该模型中位数×0.7 且还有别的号能接 ⇒ 慢号不报这个模型。钩子里零请求，数据来自面板「刷新速率」。关闭 = 慢号照旧接活。",
+      en: "Speed comes from magpie's own request log: if the latest call is below 70% of the model median and another account can serve it, the slow account stops advertising that model. No requests from hooks; data comes from the panel's Refresh speed button.",
+    },
+    default: true,
+    filtersModels: true,
+  },
 ])
 
 /**
@@ -184,6 +200,17 @@ export const LoomyAuthPlugin = async (input = {}, options = {}) => {
   // 而日志里刷了几千行「但界面开关 routecheck 已关闭」。
   // 现在把「读开关」推迟到钩子被调用时（那时钩子早已登记）。
   const routeCheckNow = () => option("routecheck", true)
+
+  // `speedskip`：关 = 不再按速率摘模型（慢号照旧接活）。
+  //
+  // 与 `routecheck` 同理必须**惰性读**（工厂期 `option()` 恒为 false）。
+  //
+  // ⚠ 两个闸门串联：供应商页的 `speedskip`（发布级）**且** 面板设置里的
+  // `speedSkip`（运行时总闸）。两个都开才摘模型 —— 「按速率跳过慢号」这件事
+  // 在面板上有自己的开关，用户拨了它却什么都不变是最糟的体验。
+  // 面板开关的读法在 `src/speed-cache.mjs`（钩子与面板共用的那一层，
+  // 避免 `src/hooks/*` 反向 import 面板宿主 server.mjs）。
+  const speedSkipNow = () => option("speedskip", true) && readSpeedSkipSetting(configDir)
 
   // `configDir` 同时喂给四条钩子：登录态（methods）、请求（loader）、
   // 额度窗口（usage）、模型目录（provider.models）。
@@ -234,7 +261,14 @@ export const LoomyAuthPlugin = async (input = {}, options = {}) => {
       id: PROVIDER,
       // `routeCheck` 开关：关掉时 models 钩子不再因「上游改路由」返回空目录。
       // 传函数而不是布尔值 —— 见上面 `routeCheckNow` 的注释（工厂期读不到用户设置）。
-      models: makeModelsHook({ baseUrl, log, configDir, routeCheck: routeCheckNow }),
+      // `speedSkip` 同理：按 `<configDir>/loomy-speed-cache.json` 摘掉慢号的模型。
+      models: makeModelsHook({
+        baseUrl,
+        log,
+        configDir,
+        routeCheck: routeCheckNow,
+        speedSkip: speedSkipNow,
+      }),
     },
   }
 }

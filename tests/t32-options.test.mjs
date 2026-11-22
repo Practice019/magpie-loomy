@@ -73,7 +73,7 @@ test("T32-L1) auth.options 形状合规：key 全小写、label 必填、default
 
   assert.deepEqual(
     options.map((o) => o.key),
-    ["bodymode", "routecheck"],
+    ["bodymode", "routecheck", "speedskip"],
     "key 一旦改名就等于把用户的设置清空 —— 名字也钉住",
   )
   assert.deepEqual(AUTH_OPTIONS.map((o) => o.key), options.map((o) => o.key))

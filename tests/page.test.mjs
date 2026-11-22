@@ -106,6 +106,8 @@ async function fixture(handler, navigator = {}, localStorage) {
       if (custom !== undefined) return custom
       const select = (rows) => call.uids === null ? rows : rows.filter((row) => call.uids.split(",").includes(row.uid))
       const data = call.path === "/api/settings" ? { accountConcurrency: 20, bindConcurrency: 20, ...call.body }
+        // 速率表（T-62）：首屏**只读**它（`GET /api/speed`，零请求）
+        : call.path === "/api/speed" ? { ok: true, updatedAt: 0, b: {}, accounts: [] }
         : call.path === "/api/accounts" ? { accounts: select(accounts), updatedAt: 1795052000000 }: call.path === "/api/hello" ? { ok: true, since: 1795050000000, uptimeMs: 600000, pid: 4242 }: call.path === "/api/route-state" ? { ok: true, state: { u1: { verdict: "routed", reason: "ledger-spark", label: "已被上游限制 · 整号停用（实际 → spark-x2.6-low）", costHint: "已扣 1 积分" } } }
         : call.path === "/api/tasks" ? { rows: select(accounts.map((a) => ({ uid: a.uid, cached: true, at: 1795052000000, tasks: Object.fromEntries(Array.from({ length: 8 }, (_, i) => [`task${i}`, a.uid === "u0"])) }))) }
           : call.path === "/api/invite" ? { rows: select(inviteRows) }
@@ -254,7 +256,8 @@ for (const concurrency of [1, 20, 50]) {
 
 test("真实 app 首屏加载 mock 账号、任务、积分与三态邀请字段", async () => {
   const f = await fixture()
-  assert.deepEqual(f.calls.map((c) => c.path).sort(), ["/api/accounts", "/api/hello", "/api/invite", "/api/route-state", "/api/settings", "/api/tasks"])
+  // 首屏 7 个 GET，全部只读本地缓存；`/api/speed` 是 T-62 的速率表（零请求）
+  assert.deepEqual(f.calls.map((c) => c.path).sort(), ["/api/accounts", "/api/hello", "/api/invite", "/api/route-state", "/api/settings", "/api/speed", "/api/tasks"])
   assert.equal(f.get("#account-summary").textContent, "显示 3 / 3 · 已选 0")
   const table = f.get("#accounts-list").innerHTML
   for (const label of ["手机号", "昵称", "初始化", "任务", "积分", "邀请", "操作", "Alpha", "mock-phone-0", "8/8", "每日 20", "永久 100", "已初始化", "未初始化", "未知"]) assert.ok(table.includes(label), label)
@@ -409,7 +412,9 @@ test("忙碌时禁用操作且直接重复事件也不重发请求", async () =>
     await f.get("#route-refresh").emit("click")
     await f.get("#invite-list").emit("click", { target: f.get('[data-bind-uid="u0"]') })
     assert.equal(f.calls.filter((c) => c.path === "/api/do").length, 1)
-    assert.equal(f.calls.length, 7)
+    // 首屏固定 6 个 GET（accounts/settings/tasks/invite/route-state/hello）
+    // + 速率表（T-62，`GET /api/speed` 只读缓存）→ 7；这里再多一次 /api/do = 8
+    assert.equal(f.calls.length, 8)
   } finally { release() }
   await f.settle()
   assert.equal(f.get("#bind-run").disabled, false)
@@ -602,7 +607,8 @@ test("复制邀请码成功、权限拒绝和不可用均给出准确提示", as
     assert.equal(f.get("#toast").classList.contains("bad"), kind !== "ok")
     if (kind === "ok") assert.deepEqual(copied, ["OWN-A"])
     else assert.match(f.get("#toast").textContent, /请手动选择邀请码复制/)
-    assert.equal(f.calls.length, 6)
+    // 首屏 6 个 GET + 速率表（T-62）= 7（复制本身不发请求）
+    assert.equal(f.calls.length, 7)
   }
 })
 

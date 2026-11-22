@@ -105,7 +105,9 @@ function harness(responses) {
         : call.path === "/api/hello" ? { ok: true, since: 1795050000000, uptimeMs: 600000, pid: 4242 }: call.path === "/api/accounts" ? { ok: true, accounts, updatedAt: 1795052000000 }: call.path === "/api/route-state" ? { ok: true, state: {} }
           : call.path === "/api/tasks" ? { ok: true, rows: [] }
             : call.path === "/api/invite" ? { ok: true, rows: [] }
-              : assert.fail(`Unexpected request: ${url}`)
+              // 速率表（T-62）：首屏只读它（零请求）
+              : call.path === "/api/speed" ? { ok: true, updatedAt: 0, b: {}, accounts: [] }
+                : assert.fail(`Unexpected request: ${url}`)
       return { ok: true, status: 200, json: async () => data }
     })()
     pending.add(task)
@@ -134,8 +136,8 @@ function harness(responses) {
 test("首屏只读缓存：批量按钮初始 disabled，hint 写清「约扣 N 积分」", async () => {
   const f = await harness()
   await f.settle()
-  // 首屏只读缓存的 5 个 GET，且不得出现任何刷新/探测请求
-  assert.deepEqual([...new Set(f.calls.map((c) => c.path))].sort(), ["/api/accounts", "/api/hello", "/api/invite", "/api/route-state", "/api/settings", "/api/tasks"])
+  // 首屏只读缓存的 6 个 GET（含 T-62 的速率表），且不得出现任何刷新/探测请求
+  assert.deepEqual([...new Set(f.calls.map((c) => c.path))].sort(), ["/api/accounts", "/api/hello", "/api/invite", "/api/route-state", "/api/settings", "/api/speed", "/api/tasks"])
   const button = f.get("#route-check-selected")
   assert.equal(button.disabled, true, "没勾选时批量按钮必须 disabled")
   assert.match(button.textContent, /检测选中 \(0\)/)
