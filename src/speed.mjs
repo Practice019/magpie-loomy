@@ -30,6 +30,55 @@
 // 同一个模型下 52 个号（实测 loomy/deepseek-v4-flash-1017）里个别号的 A 会离群
 // （刚被限速、刚好在跑长上下文）。平均值会被一两个离群号拉偏，中位数不会。
 //
+// # 行级物理过滤（第一道闸门，T-63）
+//
+//	能算出速率（out>0 && flow_ms>0） && flow_ms >= MIN_FLOW_MS && 单行速率 <= MAX_ROW_SPEED
+//
+// 三条都是**物理判据**，不是「经验阈值」：
+//
+//	· out>0 && flow_ms>0   数学必要条件（分母为零算不出速率）
+//	· flow_ms >= 20 ms     20 ms 内解不出有意义的内容
+//	· 速率 <= 1000 tok/s    真实解码峰值 300–500 tok/s，1000 已是保守上限
+//
+// # 为什么必须加这道过滤（实测 2026-11-22，7d 全量）
+//
+// `rows=100` 翻页取到 **1473 行**，其中 out>0 && flow_ms>0 的 **1273 行**、**101 个账号**：
+//
+//	magpie 的 usage/requests 里有 `flow_ms = 1` 的行：
+//	  {"providerAccount":"13151743953","out":129,"flow_ms":1,"status":200}  → 129 000 tok/s
+//
+// 这**不是「短请求」**，是 magpie 记成了 1 ms —— 物理上不可能。
+//
+// 污染机制：A 是 `sum(out)/sum(flow_ms)`，异常行只往分子加 out、分母加 1 ms
+// （≈ 不变）⇒ A 被大幅抬高 ⇒ B（中位数）被抬高 ⇒ 判定线 `B × 0.7` 抬高
+// ⇒ **真实 100 tok/s 的正常号被判 slow 误杀**。
+//
+// 同一份数据，原 vs 清洗后（B，tok/s）：
+//
+//	deepseek-v4-flash-1017   B(原)=262.9   B(清洗)=124.7    ← 差 2.1 倍
+//	DeepSeek-V4.1-Flash      B(原)=48000   B(清洗)=56.2     ← 差 850 倍
+//	auto                     B(原)=168.3   B(清洗)=168.3    ← 无污染的行，不受影响
+//
+// 阈值也从 87.3 抬到 184（flash 的 B×0.7），而真实 100 tok/s 的号正好落在中间 ⇒ 被误杀。
+//
+// **含异常行的账号：78 / 101** —— 绝大多数账号都被污染，所以不能只靠 B 的中位数/上限兜底，
+// 必须在**行级**先把这些行剔掉。三个典型污染样本：
+//
+//	13151743953  n=2  anom=2   A=79333  →  清洗后：无有效行（⇒ unknown）
+//	17032663282  n=22 anom=4   A=206.7  →  清洗后：160.4
+//	16540499742  n=22 anom=3   A=236.0  →  清洗后：205.0
+//
+// 单次 `lastSpeed` 被污染的例子（危害最大 —— 直接判这一个号）：
+//
+//	16582482173  calls=42  avg=117.3（完全正常）  但 lastSpeed=19985
+//
+// ⇒ 所以 `lastSpeed` **必须是「最近一条可信行」**，不是「最近一条行」。
+//
+// # 行级过滤与 `B_MAX` 的分工
+//
+//	第一道：`usableRow`  —— 该行的数据本身物理上不成立，直接不进任何 sum/sum 与 lastSpeed
+//	第二道：`B_MAX`      —— 万一还有别的异常形态漏过行级判据、把中位数抬高，整模型作废
+//
 // # 为什么判定看**最近一次**，而不是平均
 //
 // 突发限速是阶跃的：20 次 130 tok/s 之后突然掉到 25 tok/s，**平均值**仍然是
@@ -39,53 +88,42 @@
 //
 // `tests/speed.test.mjs` 里有一条专门钉这个差别的用例（20×130 + 1×25）。
 //
-// # 唯一必要的过滤
+// # 刻意**不加**的门槛
 //
-//	out > 0 && flow_ms > 0 && 状态正常
-//
-// 这是**数学必要条件**（分母为零算不出速率），不是「经验阈值」。**刻意不加**
-// `MIN_TOKENS` / `MIN_CALLS` 之类的门槛：实测 loomy 的真实请求里没有 out<8 的样本
-// （可算速率的最小 out=44、最低 17.3 tok/s），magpie 自己已经把 out=0 的排除在
-// 速度表外。多一道门槛只会把真实样本误杀。
-//
-// # 实测：`flow_ms` 极小值的那批行 —— **知道它，且（当前）决定不加下限**
-//
-// 现网 1000 行样本里有 28 行的速率 > 2000 tok/s，最大的离谱值来自 `flow_ms` 只有
-// 1 ms 的行：
-//
-//	{"providerAccount":"13151743953","out":94, "flow_ms":1,"status":200}  → 94,000 tok/s
-//	{"providerAccount":"16533926250","out":2,  "flow_ms":1,"status":200}  → 2,000 tok/s
-//
-// 也就是说 `flow_ms` 不是「模型吐字耗时」的干净度量：短回复被上游整块下发时，
-// 这个窗口会小到 1 ms，速率就爆表。
-//
-// **为什么仍然不加 `flow_ms` 下限**：
-//
-//	① 对**单行**判定，偏差方向只有一个 —— 虚高。它绝不可能把一个快号单独算成慢号。
-//	② 用户拍板的口径就是「`out>0 && flow_ms>0` 是唯一必要过滤」；每加一条下限都是
-//	   一个以后说不清来源的魔数。
-//
-// ⚠ 后果：该号「最后一次调用恰好是这种 1 ms 行」时会被算成 normal 而不是它的真实速度
-//   （方向是虚高，留号，不会误踢）。
-//
-// # ⚠⚠ 但 B 的稳健性是**有条件的**（别把 ① 推广成「B 永远没事」）
-//
-// 中位数只挡得住**少数**离群值。当某个模型里这种 1 ms 行占了半数以上时，B 本身
-// 就被污染了 —— 这不是理论：2026-11-22 用 7d 全量（1456 行）算出来
-//
-//	deepseek-v4-flash-1017  96 个号，B = 252.6   ← 正常（参考值 ≈126–250，量级对）
-//	DeepSeek-V4.1-Flash     34 个号，B = 48000   ← **被劫持**：其中 16 个号的 A > 2000
-//
-// B 被抬高后阈值也跟着抬高（48000×0.7），于是「最后一次是正常速度」的号被判 slow。
-// 目前的兜底只有 `MIN_FAST`：一个模型**所有**号都 slow 时谁也不让位（模型照旧全部
-// 上报）；但只要还有 1 个 normal，被判 slow 的那些号就会**丢掉这个模型** ——
-// 实测那天 DeepSeek-V4.1-Flash 上有 4 个号属于这种情况（14 normal / 4 slow / 16 unknown）。
-//
-// 想彻底修掉，最小的口子是给 B 加一条**物理上限**（真实解码速率峰值约 300–500 tok/s，
-// `B > B_MAX` 时视为无参考 ⇒ 该模型全员 unknown ⇒ 不跳过），这样不用改任何行级
-// 过滤、也不用动这里已经拍板的口径。**用户已批准并落地**（见下面的 `B_MAX`）。
+// `MIN_TOKENS` / `MIN_CALLS` 之类的样本量门槛：实测 loomy 的真实请求里没有 out<8 的样本
+// （可算速率的最小 out=44、最低 17.3 tok/s），magpie 自己已经把 out=0 的排除在速度表外。
+// 多一道样本量门槛只会把真实样本误杀。行级过滤的三条都是**物理不可能**才拦，同理。
 
-/** 判定阈值：最近一次速率 < B × SLOW_RATIO ⇒ slow。 */
+/**
+ * 解码耗时下限（ms）：**20 ms 内解不出有意义的内容**。
+ *
+ * magpie 的 `usage/requests` 里有 `flow_ms = 1` 的行（实测 `out=129, flow_ms=1`
+ * ⇒ 129 000 tok/s）。这是**计时粒度错误**，不是「短请求」—— 物理上不可能。
+ *
+ * 实测依据（2026-11-22，7d 全量 `rows=100` 翻页取到 1473 行、有效 1273 行、101 个账号）：
+ *
+ *	含异常行的账号：78 / 101          ← 绝大多数账号被污染
+ *	flash   B(原)=262.9 → B(清洗)=124.7
+ *	V4.1    B(原)=48000 → B(清洗)=56.2
+ *	auto    B(原)=168.3 → B(清洗)=168.3（无污染，不受影响）
+ *
+ * 后果：判定线 `B×0.7` 从 87.3 被抬到 184 ⇒ 真实 100 tok/s 的正常号被判 slow 误杀。
+ *
+ * 所以这批行**不进** `sum(out)/sum(flow_ms)`，也不许当 `lastSpeed`。
+ */
+export const MIN_FLOW_MS = 20
+
+/**
+ * 单行速率的物理上限（tok/s）：真实解码峰值 300–500 tok/s，1000 已是保守上限。
+ *
+ * 与 {@link MIN_FLOW_MS} 互补：`flow_ms` 未缺失但也没小到 1 ms（比如 5 ms 出 4000 token）
+ * 时，靠这条把「速率本身不可能」的行挡掉。边界**包含**（恰 1000 仍可信）。
+ */
+export const MAX_ROW_SPEED = 1000
+
+/**
+ * 判定阈值：最近一次速率 < B × SLOW_RATIO ⇒ slow。
+ */
 export const SLOW_RATIO = 0.7
 
 /** 超过这么多天没有新记录 ⇒ unknown（自动回到候选，不被旧结论钉死）。 */
@@ -99,28 +137,53 @@ export const STALE_DAYS = 3
 export const MIN_FAST = 1
 
 /**
- * B 的**物理上限**（tok/s）：真实解码峰值约 300–500 tok/s。
+ * B 的**物理上限**（tok/s）：真实解码峰值约 300–500 tok/s —— **第二道保险**。
  *
- * 中位数越过这个量级，说明这个模型的样本被 `flow_ms` ≈ 1ms 的行**污染**了 ——
- * 它反映的是 magpie 侧的计时粒度，不是模型速度。此时 B 不能当基准：
- * 按「最近一次 < B × 0.7」去判，会让一批**实际上正常**的号被判 slow 并丢掉整个模型。
+ * # 分工
  *
- * `b = null` ⇒ 该模型所有账号 `classify` 返回 `unknown` ⇒ **一个都不跳过**
- * （`MIN_FAST` 那条路径自然也就不触发）。宁可少让位，也不许按错误的基准错踢。
+ *	第一道：{@link usableRow} —— 行级过滤（`flow_ms >= 20` 且 `单行速率 <= 1000`）。
+ *	         实测污染的账号是 78/101，靠中位数挡不住，必须在行级剔掉。
+ *	第二道：`B_MAX`          —— 万一还有别的异常形态漏过行级判据、把中位数抬到
+ *	         物理不可能的量级，就整模型作废：`b = null` ⇒ 全员 `unknown` ⇒ 一个都不跳过
+ *	         （`MIN_FAST` 那条路径自然也就不触发）。
  *
- * # 实测依据（2026-11-22，7d 全量 1456 行）
+ * 宁可少让位，也不许按错误的基准错踢。
  *
- *	deepseek-v4-flash-1017   96 个号   B = 252.6    正常（参考值 ≈126–250，量级一致）
- *	DeepSeek-V4.1-Flash      34 个号   B = 48000    **被劫持**：其中 16 个号的 A > 2000
+ * # 实测依据（2026-11-22，7d 全量 1473 行）
  *
- * 同一份数据里 `deepseek-v4-flash-1017` 的 B 落在正常区间，正是「有污染 / 没污染」
- * 两条路径的对照 —— 这也是为什么阈值取在 1000：真实速率够不到，污染样本远高于它。
- * 边界是**包含**的（`B === B_MAX` 仍参与判定），只有真正越过才算无参考。
+ *	deepseek-v4-flash-1017   B(原)=262.9   B(清洗)=124.7
+ *	DeepSeek-V4.1-Flash      B(原)=48000   B(清洗)=56.2    ← 曾被这条上限整个挡掉
+ *
+ * 加了行级过滤之后 `DeepSeek-V4.1-Flash` 的 B 回到 56.2，正常参与判定；
+ * `B_MAX` 则继续守着「哪天冒出别的异常形态」这一种情况。
+ * 阈值取在 1000：真实速率够不到，污染样本远高于它。边界是**包含**的
+ * （`B === B_MAX` 仍参与判定），只有真正越过才算无参考。
  */
 export const B_MAX = 1000
 
 /** 一天的毫秒数（`STALE_DAYS` 的单位）。 */
 const DAY_MS = 86_400_000
+
+/**
+ * 一个中位数是否**能当基准**（第二道闸门，见 {@link B_MAX}）。
+ *
+ * 第一道是 {@link usableRow}（行级）：把 `flow_ms=1` 的行剔掉之后，`A = Σout/Σ秒`
+ * 本质上是「逐行速率的耗时加权均值」⇒ 每行都不超过 `MAX_ROW_SPEED` 时 A 也不可能
+ * 超过它 ⇒ **正常路径上 B 已经到不了 1000 以上**。这个守卫留给两种例外：
+ *
+ *	· 缓存里存着旧版本（或人手改过）写进来的越界 b
+ *	· 以后出现别的、行级判据没覆盖到的异常形态
+ *
+ * 越界 ⇒ 返回 `null`（= 这个模型没有可用基准）⇒ 全员 `unknown` ⇒ 一个都不跳过。
+ *
+ * @param {any} raw
+ * @returns {number|null}
+ */
+export function usableB(raw) {
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n <= 0) return null
+  return n <= B_MAX ? n : null
+}
 
 /**
  * 单次请求的速率（tok/s）；算不出来返回 `null`（**不是 0**）。
@@ -167,6 +230,32 @@ export function statusOk(row) {
 }
 
 /**
+ * 这一行是否**可信**（可以进 `sum/sum` 与 `lastSpeed`）。
+ *
+ * 三条判据，全是「物理上不成立才拦」：
+ *
+ *	① 状态正常（{@link statusOk}：499 取消的耗时不是模型吐字）
+ *	② `flow_ms >= MIN_FLOW_MS`（20 ms 内解不出有意义的内容；magpie 有 flow_ms=1 的行）
+ *	③ 单行速率 `<= MAX_ROW_SPEED`（真实峰值 300–500 tok/s，1000 已是保守上限）
+ *
+ * 实测（2026-11-22，7d 全量 1473 行 / 101 账号）：**78 个账号含这种异常行**，
+ * 它只会把 A 抬高 ⇒ B 抬高 ⇒ 判定线抬高 ⇒ 正常号被误判 slow。所以宁可这行不算，
+ * 也不要让它进任何分母/分子 —— 全部行都不可信的账号 ⇒ `lastSpeed = null` ⇒ `unknown`
+ * （面板显示 `—`，不跳过），**宁可 null 也不给虚假值**。
+ *
+ * @param {any} row usage/requests 的一行
+ * @returns {boolean}
+ */
+export function usableRow(row) {
+  if (!statusOk(row)) return false
+  const flow = Number(row?.flow_ms)
+  if (!Number.isFinite(flow) || flow < MIN_FLOW_MS) return false
+  const speed = speedOfRow(row)
+  if (speed === null) return false
+  return speed <= MAX_ROW_SPEED
+}
+
+/**
  * 行的时间戳（毫秒）。认 `t`（RFC3339）与 `at` / `ts`（毫秒数）。
  *
  * 认不出返回 `null` —— 调用方据此把这行排除在「最近一次」的比较之外，
@@ -203,20 +292,19 @@ export function median(nums) {
 /**
  * 一组请求的账号级速率 A = Σout / Σ(秒)。
  *
+ * **只算可信行**（{@link usableRow}）。实测 `out=129, flow_ms=1` 这种行只往分子
+ * 加分母不变：混进去会让 A 从 100 变成 229（再往下就是 B 与判定线一起虚高）。
+ *
  * @param {any[]} rows 同一 (账号, 模型) 的行
- * @returns {number|null} 没有可算的行 ⇒ null（**不是 0**）
+ * @returns {number|null} 没有可信行 ⇒ null（**不是 0**）
  */
 export function accountAverage(rows) {
   let tokens = 0
   let seconds = 0
   for (const row of Array.isArray(rows) ? rows : []) {
-    if (!statusOk(row)) continue
-    const out = Number(row?.out)
-    const flow = Number(row?.flow_ms)
-    if (!Number.isFinite(out) || out <= 0) continue
-    if (!Number.isFinite(flow) || flow <= 0) continue
-    tokens += out
-    seconds += flow / 1000
+    if (!usableRow(row)) continue
+    tokens += Number(row.out)
+    seconds += Number(row.flow_ms) / 1000
   }
   if (!(seconds > 0)) return null
   return tokens / seconds
@@ -232,9 +320,11 @@ export function accountAverage(rows) {
  *
  * # unknown 的三种来源（都必须退回候选，绝不当成「慢」）
  *
- *	① 没有最近记录（`lastRow` 为 null）
+ *	① 没有最近记录（`lastRow` 为 null；含「全部行都不可信」）
  *	② 最近记录早于 `STALE_DAYS`（超过 3 天没新数据 = 不知道现在怎么样）
  *	③ `b` 为 null（这个模型还没有中位数：只有一个号或全都算不出）
+ *
+ * 吃原始行时也要过 {@link usableRow}：`flow_ms=1` 的行不许当场算出 129000 tok/s。
  *
  * @param {any} lastRow 该 (账号, 模型) 的**最近一次**可用请求
  * @param {number|null} b 该模型的中位数 B
@@ -247,7 +337,7 @@ export function classify(lastRow, b, now) {
 
   const speed = Number.isFinite(Number(lastRow.lastSpeed)) && lastRow.lastSpeed !== null
     ? Number(lastRow.lastSpeed)
-    : speedOfRow(lastRow)
+    : usableRow(lastRow) ? speedOfRow(lastRow) : null
   if (speed === null || !Number.isFinite(speed)) return "unknown"
 
   const rawAt = Number.isFinite(Number(lastRow.lastAt)) && lastRow.lastAt !== null
@@ -275,9 +365,9 @@ export function classify(lastRow, b, now) {
  *	  }
  *	}
  *
- * ⚠ `b` 里**只放能当基准的模型**：中位数越过 {@link B_MAX} 的模型（样本被
- * `flow_ms≈1ms` 的行污染）**不会出现**，它在 `accounts` 里的条目一律是 `unknown`。
- * 所以「`b` 里没有这个模型」是正常结论，不是漏算。
+ * ⚠ `b` 里**只放能当基准的模型**：中位数越过 {@link B_MAX} 的模型**不会出现**，
+ * 它在 `accounts` 里的条目一律是 `unknown`。行级过滤（{@link usableRow}）是第一道闸门，
+ * `B_MAX` 是第二道 —— 所以「`b` 里没有这个模型」是正常结论，不是漏算。
  *
  * 键是 `模型|账号`（账号 = 行里的 `providerAccount`，见 models.mjs 的对齐说明）。
  * 模型 id 直接用行里的 `model` —— 实测它就是上游目录的 id
@@ -285,8 +375,10 @@ export function classify(lastRow, b, now) {
  *
  * # `calls`
  *
- * 参与计算的行数（`out>0 && flow_ms>0 && 状态正常`），也就是 `avgSpeed` 的样本量。
- * 被过滤掉的行不计入 —— 否则面板上的「调用次数」会包含取消掉的请求。
+ * 参与计算的行数（**只数可信行**，见 {@link usableRow}），也就是 `avgSpeed` 的样本量。
+ * 被过滤掉的行不计入 —— 否则面板上的「调用次数」会包含取消掉的请求与 `flow_ms=1` 的脏行。
+ * 「全部行都不可信」⇒ `calls = 0`、`lastSpeed = null`、`avgSpeed = null` ⇒ `verdict = unknown`
+ * （面板显示 `—`，不跳过一个号）。
  *
  * @param {any[]} rows
  * @param {{now?: number}} [opts]
@@ -313,7 +405,9 @@ export function buildSpeedTable(rows, opts = {}) {
   /** @type {Array<{model: string, account: string, lastSpeed: number|null, lastAt: number, avgSpeed: number|null, calls: number}>} */
   const entries = []
   for (const group of groups.values()) {
-    const usable = group.rows.filter((row) => statusOk(row) && speedOfRow(row) !== null)
+    // 行级物理过滤是**第一道**闸门：`flow_ms=1` 的行既不算 A，也不许当 lastSpeed。
+    // 实测 101 个账号里 78 个含这种行 —— 不过滤就会把 B 与判定线一起抬起来误杀正常号。
+    const usable = group.rows.filter(usableRow)
     let lastRow = null
     let lastAt = 0
     for (const row of usable) {
@@ -327,7 +421,9 @@ export function buildSpeedTable(rows, opts = {}) {
     entries.push({
       model: group.model,
       account: group.account,
-      lastSpeed: speedOfRow(lastRow),
+      // 「最近一条**可信**行」，不是「最近一条行」：最近那条若恰好是 1 ms 脏行，
+      // 取它会把 lastSpeed 算成 19985 这种值（实测 16582482173 就是这样）。
+      lastSpeed: lastRow ? speedOfRow(lastRow) : null,
       lastAt,
       avgSpeed: accountAverage(group.rows),
       calls: usable.length,
@@ -337,10 +433,10 @@ export function buildSpeedTable(rows, opts = {}) {
   // B：每个模型下所有账号 A 的中位数。**算不出 A 的账号不参与**
   // （把它们当 0 会把中位数整体拉低，于是所有正常号都被判成 normal）。
   //
-  // ⚠ 算完之后还要过一道 `B_MAX`（见常量注释）：中位数只挡得住**少数**离群值，
-  //   当某个模型里 `flow_ms≈1ms` 的行过半时，B 本身会被抬到 48000 这种量级。
-  //   越过上限 ⇒ 当作「这个模型没有可用基准」（**不出现在 b 里**）⇒ 所有账号
-  //   `classify` 拿到 null ⇒ 全员 unknown ⇒ 一个都不跳过。
+  // ⚠ 这里的 A 已经只来自可信行（`usableRow`，第一道）。`B_MAX` 是**第二道**保险：
+  //   万一还漏了别的异常形态把中位数抬到物理不可能的量级，越过上限 ⇒
+  //   「这个模型没有可用基准」（**不出现在 b 里**）⇒ 所有账号 `classify` 拿到 null
+  //   ⇒ 全员 unknown ⇒ 一个都不跳过。
   /** @type {Map<string, number[]>} */
   const perModel = new Map()
   for (const entry of entries) {
@@ -352,9 +448,9 @@ export function buildSpeedTable(rows, opts = {}) {
   /** @type {Record<string, number>} */
   const b = {}
   for (const [model, list] of perModel) {
-    const raw = median(list)
-    // 边界包含：恰好在 B_MAX 上仍然算有效基准
-    if (raw !== null && raw <= B_MAX) b[model] = raw
+    // 第二道闸门：`usableB` 只放行 <= B_MAX 的中位数（边界包含）
+    const usable = usableB(median(list))
+    if (usable !== null) b[model] = usable
   }
 
   /** @type {Record<string, any>} */

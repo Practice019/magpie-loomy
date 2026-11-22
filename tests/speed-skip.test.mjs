@@ -136,13 +136,23 @@ test("normal 号在任何情况下都不被跳过", async (t) => {
   assert.ok(out.m1)
 })
 
-// ── 二之前：B 被 `flow_ms≈1ms` 的行污染时，**一个号都不许摘** ─────────────
+// ── 二之前：`flow_ms=1` 的异常行不再污染 B，真实正常号不被判 slow ────────
 //
-// 实测形态（DeepSeek-V4.1-Flash，34 号，16 个 A>2000，中位数 48000）：如果按
-// 48000×0.7 去判，一批本来正常的号会被判 slow 并丢掉整个模型。`B_MAX` 把这种
-// 「没有可用基准」的模型按 unknown 处理 —— 端到端的效果就是**模型目录一个字都不变**。
+// 实测形态（DeepSeek-V4.1-Flash，34 号，16 个 A>2000，中位数 48000）：行级过滤
+// `MIN_FLOW_MS=20` + `MAX_ROW_SPEED=1000` 是**第一道**，先把 `flow_ms=1` 的行剔掉；
+// `B_MAX` 是**第二道**，兜外来的越界 b。两者都不许把「真实正常」的号判成 slow。
 
-test("核心：B 被污染（中位数 48000 ⇒ 越过 B_MAX）⇒ 全员 unknown，models 钩子一个都不摘", async (t) => {
+test("核心：1ms 型爆表行不污染 B，真实正常号不被判 slow（模型目录不被误摘）", async (t) => {
+  /** 1 ms 型脏行：实测 `out=129, flow_ms=1` ⇒ 129 000 tok/s。 */
+  const garbage = (account) => ({
+    provider: "loomy",
+    providerAccount: account,
+    model: "m1",
+    status: 200,
+    out: 129,
+    flow_ms: 1,
+    t: new Date(NOW - 30_000).toISOString(),
+  })
   const row = (account, out) => ({
     provider: "loomy",
     providerAccount: account,
@@ -152,32 +162,34 @@ test("核心：B 被污染（中位数 48000 ⇒ 越过 B_MAX）⇒ 全员 unkno
     flow_ms: 1000,
     t: new Date(NOW - 60_000).toISOString(),
   })
-  // 三个「1ms 型爆表号」把中位数抬到 48000（43200 / 48000 / 52800 的中位数）
+  // 三个「1ms 型爆表号」：过滤前会把中位数抬到 48000，过滤后无有效行 ⇒ unknown
   const rows = [
-    row("h0", 43200),
-    row("h1", 48000),
-    row("h2", 52800),
-    // 正常速度的号：若 B=48000 被采用，阈值 33600 ⇒ 会被误判 slow 并丢掉 m1
-    row("normal-ish", 30),
-    // 另一个号：用来满足 MIN_FAST —— 如果判定真被触发，m1 一定会被摘
-    row("h3", 900),
+    garbage("h0"),
+    garbage("h1"),
+    garbage("h2"),
+    // 真实正常速度的号：过滤前若 B=48000（阈值 33600）会被判 slow 并丢掉 m1
+    row("normal", 130),
+    // 另一个正常号：把 B 钉在 130
+    row("ref", 130),
   ]
   const table = buildSpeedTable(rows, { now: NOW })
-  assert.deepEqual(table.b, {}, "越过 B_MAX 的模型不许出现在 b 里（= 没有可用基准）")
-  assert.equal(
-    Object.values(table.accounts).every((e) => e.verdict === "unknown"),
-    true,
-    "没有基准 ⇒ 全员 unknown（不许判 slow）",
-  )
+  assert.equal(table.b.m1, 130, "B 只来自可信行：1ms 脏行不许进中位数")
+  assert.equal(table.accounts["m1|normal"].verdict, "normal", "真实 130 tok/s 不许被判 slow")
+  assert.equal(table.accounts["m1|normal"].lastSpeed, 130)
+  for (const a of ["h0", "h1", "h2"]) {
+    const e = table.accounts[`m1|${a}`]
+    assert.equal(e.verdict, "unknown", `${a} 没有可信行 ⇒ unknown（未知 ≠ 不可用）`)
+    assert.equal(e.lastSpeed, null, "宁可 null 也不要 129000 这种虚假值")
+  }
 
-  // 端到端：把这份表当缓存喂给真钩子，一个模型都不许摘
-  const dir = mkdtempSync(join(tmpdir(), "loomy-speed-bmax-"))
+  // 端到端：把这份表当缓存喂给真钩子，任何人的模型目录都不许被误摘
+  const dir = mkdtempSync(join(tmpdir(), "loomy-speed-rowfilter-"))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   assert.ok(writeSpeedCache(dir, table).ok)
   resetCatalogInflight()
   resetModelsWarned()
   const hook = makeModelsHook({ fetchImpl: fakeCatalog(), log: { warn() {} }, configDir: dir, speedSkip: true })
-  for (const account of ["normal-ish", "h1"]) {
+  for (const account of ["normal", "h1"]) {
     const out = await hook({ models: {} }, { auth: authOf(account) })
     assert.deepEqual(Object.keys(out).sort(), ["m1", "m2"], `${account} 的模型目录必须一个字都不变`)
   }

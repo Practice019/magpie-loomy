@@ -22,7 +22,11 @@ import {
   STALE_DAYS,
   MIN_FAST,
   B_MAX,
+  MIN_FLOW_MS,
+  MAX_ROW_SPEED,
   speedOfRow,
+  usableRow,
+  usableB,
   median,
   accountAverage,
   classify,
@@ -180,32 +184,45 @@ test("buildSpeedTable：常量与口径（SLOW_RATIO 0.7 / STALE_DAYS 3 / MIN_FA
   assert.equal(MIN_FAST, 1)
 })
 
-// ── 六、B_MAX：B 被 `flow_ms≈1ms` 的行污染时不许当基准 ────────────────────
+// ── 六、B_MAX：第二道保险（第一道是行级过滤 usableRow） ────────────────
+//
+// 行级过滤是**第一道**：`out=129/flow_ms=1` 这类行已经被 `usableRow` 挡掉，
+// 于是 `A = Σout/Σ秒` 是逐行速率的耗时加权均值 ⇒ 每行不超过 MAX_ROW_SPEED 时 A 也
+// 不会超过它 ⇒ 正常路径上 B 已经到不了 1000 以上（实测污染后 B=48000 正是靠第一道
+// 被挡掉，见第七节）。`B_MAX` 仍然保留，兜的是**外来的**越界 b（旧缓存、人手改的
+// 文件）与将来没被行级判据覆盖的异常形态 —— 宁可整模型作废，也不按错误基准错踢。
 
 /**
- * 造一个「中位数 = target」的模型：3 个号，A = [target×0.9, target, target×1.1]。
- * 每号一条行 ⇒ A 就等于该行的单次速率。
+ * 造一个「A 恰好 = target」的模型：3 个号，每号一条行 ⇒ A 就等于该行的单次速率。
+ * `target` 必须 <= MAX_ROW_SPEED（超过 1000 的行会被第一道闸门直接剔掉）。
  */
-function rowsWithMedian(account, model, target) {
-  return [0.9, 1, 1.1].map((k, i) =>
-    sample({ providerAccount: `${account}${i}`, model, out: 100 * k, flow_ms: 1000 / target * 100, t: at(NOW - 60_000) }),
+function rowsWithAverage(account, model, target) {
+  return [0, 1, 2].map((i) =>
+    sample({ providerAccount: `${account}${i}`, model, out: target, flow_ms: 1000, t: at(NOW - 60_000) }),
   )
 }
 
 test("B_MAX 边界包含：中位数恰为 1000 ⇒ 仍参与判定（按 1000 判）", () => {
   assert.equal(B_MAX, 1000, "真实解码峰值 300–500 tok/s：1000 是「物理不可能」的分界")
-  const table = buildSpeedTable(rowsWithMedian("acc", "m", 1000), { now: NOW })
+  const table = buildSpeedTable(rowsWithAverage("acc", "m", 1000), { now: NOW })
   assert.equal(table.b.m, 1000, "恰好等于上限仍是有效基准")
-  // 1000×0.7 = 700：900 > 700 ⇒ normal
+  // 1000×0.7 = 700：1000 > 700 ⇒ normal
   assert.equal(table.accounts["m|acc0"].verdict, "normal")
   assert.equal(table.accounts["m|acc1"].verdict, "normal")
   assert.equal(table.accounts["m|acc2"].verdict, "normal")
 })
 
-test("B_MAX：中位数 1001（略高于上限）⇒ 视为无参考，全员 unknown", () => {
-  const table = buildSpeedTable(rowsWithMedian("acc", "m", 1001), { now: NOW })
-  assert.equal(table.b.m, undefined, "越过 1000 就不许当基准")
-  assert.equal(Object.values(table.accounts).every((e) => e.verdict === "unknown"), true)
+test("B_MAX：越界的中位数（1001 / 48000）⇒ 视为无参考，全员 unknown", () => {
+  assert.equal(usableB(1000), 1000, "边界包含：恰在上限上放行")
+  assert.equal(usableB(1001), null, "越过 1000 就不许当基准")
+  assert.equal(usableB(48000), null, "实测被污染模型的中位数，同样不许当基准")
+  assert.equal(usableB(0), null)
+  assert.equal(usableB(null), null)
+  // 越界 b ⇒ classify 拿到 null ⇒ unknown ⇒ 一个都不跳过
+  assert.equal(classify({ lastSpeed: 100, lastAt: NOW - 1000 }, usableB(48000), NOW), "unknown")
+  assert.equal(classify({ lastSpeed: 100, lastAt: NOW - 1000 }, usableB(1001), NOW), "unknown")
+  // 边界内的 b 照常判定（800 >= 1000×0.7 ⇒ normal）
+  assert.equal(classify({ lastSpeed: 800, lastAt: NOW - 1000 }, usableB(1000), NOW), "normal")
 })
 
 test("buildSpeedTable：没有可用行 / 没有账号的模型不出现在 b 里", () => {
@@ -217,4 +234,99 @@ test("buildSpeedTable：没有可用行 / 没有账号的模型不出现在 b �
   assert.deepEqual(table.b, {}, "算不出 A 的账号不参与中位数（否则 B 会被 0 拉低）")
   assert.equal(table.accounts["m|a"].avgSpeed, null)
   assert.equal(table.accounts["m|a"].verdict, "unknown")
+})
+
+// ── 七、行级物理过滤：`flow_ms≈1ms` 的异常行不许进分子分母（T-63） ────────
+//
+// 实测（2026-11-22，7d 全量 1473 行、有效 1273 行、101 个账号，**78 个账号含异常行**）：
+// magpie 的 usage/requests 里有 `flow_ms=1` 的行（`out=129, flow_ms=1` → 129 000 tok/s）。
+// 它在 `sum(out)/sum(flow_ms)` 里只往分子加 129、分母加 1 ms ⇒ 账号 A 被抬高
+// ⇒ B 被抬高 ⇒ 判定线 `B×0.7` 抬高 ⇒ 真实 100 tok/s 的正常号被判 slow。
+//
+// 这不是「短请求」：20 ms 内解不出有意义的内容，1 ms 更不可能。物理上不成立。
+
+test("usableRow：out=129 / flow_ms=1 → false（1 ms 里解不出 129 个 token）", () => {
+  assert.equal(MIN_FLOW_MS, 20, "解码耗时下限（<20ms 的窗口不是模型吐字耗时）")
+  assert.equal(usableRow(sample({ out: 129, flow_ms: 1 })), false, "1 ms 不可能")
+  assert.equal(usableRow(sample({ out: 94, flow_ms: 19 })), false, "低于 MIN_FLOW_MS=20 一律不可信")
+  assert.equal(usableRow(sample({ out: 20, flow_ms: 20 })), true, "边界包含：恰 20 ms 且 1000 tok/s 仍可信")
+})
+
+test("usableRow：单行速率越过物理上限 1000 tok/s → false；真实 100 tok/s → true", () => {
+  assert.equal(MAX_ROW_SPEED, 1000, "真实解码峰值 300–500 tok/s：1000 已是保守上限")
+  assert.equal(usableRow(sample({ out: 1000, flow_ms: 1 })), false, "1e6 tok/s：物理上不可能")
+  assert.equal(usableRow(sample({ out: 100, flow_ms: 1000 })), true, "100 tok/s 是正常号")
+  assert.equal(usableRow(sample({ out: 1000, flow_ms: 1000 })), true, "边界包含：1000 tok/s 仍可信")
+  assert.equal(usableRow(sample({ out: 1001, flow_ms: 1000 })), false, "1001 越过上限")
+})
+
+test("核心：accountAverage 混入 1 ms 异常行 ⇒ 100（不是 229）", () => {
+  const rows = [sample({ out: 100, flow_ms: 1000 }), sample({ out: 129, flow_ms: 1 })]
+  assert.equal(accountAverage(rows), 100, "只算可信行：100 tok / 1.0 s")
+  // 对照：不过滤时 (100+129)/(1.001) ≈ 228.8 —— 这就是误杀的来源
+  assert.ok(Math.abs((100 + 129) / 1.001 - 228.77) < 0.05)
+  assert.equal(accountAverage([sample({ out: 129, flow_ms: 1 })]), null, "全异常 ⇒ null，不是 129000")
+})
+
+test("核心：buildSpeedTable 真实污染比例（10 号 5 个含异常行）⇒ B 不被抬高", () => {
+  /** 一个号的正常行：100 tok / 1000 ms = 100 tok/s。 */
+  const normal = (account) => sample({ providerAccount: account, model: "m", out: 100, flow_ms: 1000, t: at(NOW - 60_000) })
+  /** 该号额外多一条 1 ms 异常行（实测形态 out=129 / flow_ms=1）。 */
+  const garbage = (account) => sample({ providerAccount: account, model: "m", out: 129, flow_ms: 1, t: at(NOW - 30_000) })
+
+  const accounts = Array.from({ length: 10 }, (_, i) => `a${i}`)
+  const rows = accounts.flatMap((a, i) => (i < 5 ? [normal(a), garbage(a)] : [normal(a)]))
+
+  // 对照：不过滤时那 5 个号的 A = 229/1.001 ≈ 228.8 ⇒ 中位数被抬到 ≈164
+  const unfiltered = median(accounts.map((a) =>
+    (i2(rows, a).reduce((s, r) => s + Number(r.out), 0)) / (i2(rows, a).reduce((s, r) => s + Number(r.flow_ms), 0) / 1000),
+  ))
+  assert.ok(unfiltered > 150, `未过滤时 B 必须被抬高（实际 ${unfiltered}）`)
+
+  const table = buildSpeedTable(rows, { now: NOW })
+  assert.equal(table.b.m, 100, `过滤后 B 必须回到真实值 100（未过滤是 ${unfiltered}）`)
+  for (const a of accounts) assert.equal(table.accounts[`m|${a}`].verdict, "normal", `${a} 是 100 tok/s 的正常号`)
+})
+
+/** 取出某账号在 rows 里的一行行（测试局部用，避免噪声）。 */
+function i2(rows, account) {
+  return rows.filter((r) => r.providerAccount === account)
+}
+
+test("核心：lastSpeed 取「最近一条**可信**行」—— 最近一条是异常行也不算", () => {
+  const account = "g"
+  const rows = [
+    // t=100：正常 100 tok/s
+    sample({ providerAccount: account, model: "m", out: 100, flow_ms: 1000, t: at(NOW - 100_000) }),
+    // t=200：更新的那条是 1 ms 异常行（129 000 tok/s）
+    sample({ providerAccount: account, model: "m", out: 129, flow_ms: 1, t: at(NOW - 10_000) }),
+    // 另一个正常号，把 B 钉在 100
+    sample({ providerAccount: "ref", model: "m", out: 100, flow_ms: 1000, t: at(NOW - 60_000) }),
+  ]
+  const table = buildSpeedTable(rows, { now: NOW })
+  const entry = table.accounts[`m|${account}`]
+  assert.equal(entry.lastSpeed, 100, "必须是可信行（t=100）的速率，不是 129000")
+  assert.equal(entry.lastAt, NOW - 100_000, "lastAt 跟着那条可信行走")
+  assert.equal(entry.avgSpeed, 100)
+  assert.equal(entry.calls, 1, "calls 只数可信行")
+  assert.equal(entry.verdict, "normal")
+})
+
+test("全部行异常 ⇒ lastSpeed=null ⇒ verdict=unknown ⇒ 面板显示 —，不判 slow", () => {
+  const account = "13151743953"
+  const rows = [
+    // 实测：n=2 anom=2，两条都是 1 ms 行
+    sample({ providerAccount: account, model: "m", out: 129, flow_ms: 1, t: at(NOW - 20_000) }),
+    sample({ providerAccount: account, model: "m", out: 94, flow_ms: 1, t: at(NOW - 10_000) }),
+    // 同模型另一个正常号：B 有基准，所以「unknown」不是因为 b=null，而是这号没可信样本
+    sample({ providerAccount: "ref", model: "m", out: 100, flow_ms: 1000, t: at(NOW - 60_000) }),
+  ]
+  const table = buildSpeedTable(rows, { now: NOW })
+  const entry = table.accounts[`m|${account}`]
+  assert.ok(entry, "条目必须还在（面板要显示这一行，不能整条消失）")
+  assert.equal(entry.lastSpeed, null, "宁可 null 也不要虚假值")
+  assert.equal(entry.avgSpeed, null)
+  assert.equal(entry.calls, 0)
+  assert.equal(entry.verdict, "unknown", "未知 ≠ 不可用：不许判 slow")
+  assert.equal(table.b.m, 100, "B 只来自可信行")
 })
