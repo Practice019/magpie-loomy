@@ -1,6 +1,6 @@
 const $ = (s) => document.querySelector(s)
 const $$ = (s) => Array.from(document.querySelectorAll(s))
-const BASE = new URL(document.currentScript.src).origin
+const BASE = new URL('..', document.currentScript?.src || document.baseURI).href.replace(/\/$/, '')
 const state = { accounts: [], tasks: new Map(), invites: new Map(), route: new Map(), selected: new Set(), busy: false, accountPage: 1, invitePage: 1, accountSize: 50, inviteSize: 50,
   // 面板设置（服务端权威值；`batchSkipChecked` 决定批量是否跳号）
   // ⚠ `focusRefresh` 本地初值必须是 false：服务端没读到之前，切窗口一律不重读。
