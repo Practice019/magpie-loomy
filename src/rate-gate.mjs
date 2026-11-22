@@ -89,7 +89,11 @@ export function makeRateGate(opts = {}) {
    * 每个节拍先补桶，然后把可用令牌**连续发放**（一次 tick 发多个）——
    * 否则 300 个号的队列会按「每 tick 一个」爬行。
    *
-   * `unref()` 是必须的：测试结束后不能因为一个定时器把进程吊着。
+   * 定时器**不能 unref**：它一响就要唤醒正在等待的 acquire()，那个 Promise
+   * 只有靠这个定时器才能 resolve。unref 之后，Linux/Node 在没有其它活动句柄
+   * 时事件循环会提前结束，等待者永远等不到放行（cancelledByParent，见
+   * magpie-officeace/docs/internals.md 的同款事故）。定时器只在有人排队时
+   * 存在、队列空即 `return` 停止，不会把进程永久吊住 —— 所以 ref 是安全的。
    */
   function ensureTimer() {
     if (timerOn || waiting === 0) return
@@ -109,11 +113,9 @@ export function makeRateGate(opts = {}) {
       }
       // 节拍取 `refillMs` 与 25ms 的较小值：窗口还没到也要醒来看看，
       // 保证「窗口一到就立刻放行」，不会因为定时器粒度多等一个窗口。
-      const handle = setTimer(tick, Math.min(refillMs, 25))
-      handle?.unref?.()
+      setTimer(tick, Math.min(refillMs, 25))
     }
-    const handle = setTimer(tick, Math.min(refillMs, 25))
-    handle?.unref?.()
+    setTimer(tick, Math.min(refillMs, 25))
   }
 
   /**

@@ -3,6 +3,7 @@ import assert from "node:assert/strict"
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, dirname } from "node:path"
+import { fileURLToPath } from "node:url"
 import { request } from "node:http"
 import { startServer } from "../server.mjs"
 import { TASK_DEFS } from "../src/points.mjs"
@@ -443,7 +444,10 @@ function writeTempAsset(assetsDir, size) {
 test("静态文件 200KB / 600KB：字节数与 sha256 都必须与磁盘一致，且带 Content-Length", async (t) => {
   const { createHash } = await import("node:crypto")
   const sha = (buf) => createHash("sha256").update(buf).digest("hex")
-  const assetsDir = join(dirname(new URL("../page/assets/app.js", import.meta.url).pathname.slice(1)), "")
+  // fileURLToPath is portable: Windows' pathname is "/C:/..." (the old
+  // `.slice(1)` hack turned it into "C:/..."), but Linux' is "/root/..." and
+  // `.slice(1)` there produced a bogus relative "root/..." path.
+  const assetsDir = dirname(fileURLToPath(new URL("../page/assets/app.js", import.meta.url)))
   const f = await fixture(t, undefined, 1)
 
   for (const size of [200 * 1024, 600 * 1024]) {

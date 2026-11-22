@@ -22,14 +22,18 @@ import { EventEmitter } from "node:events"
 import { startServer, applyRoute } from "../server.mjs"
 
 /** 假 spawn：记录调用、可控制退出码 / 是否永不回调。 */
-function fakeSpawn({ code = 0, hang = false } = {}) {
+function fakeSpawn({ code = 0, hang = false, closeDelayMs = 0 } = {}) {
   const calls = []
   const spawnImpl = (cmd, args, options) => {
     calls.push({ cmd, args, options })
     const child = new EventEmitter()
     child.kill = () => { calls[calls.length - 1].killed = true }
     if (hang) return child
-    setTimeout(() => child.emit("close", code), 0)
+    // A real `magpie plugin list` runs long enough that concurrent requests
+    // overlap in the in-flight window. A 0ms close can fire before the second
+    // HTTP request is even dispatched, making the dedup test flaky; callers
+    // that exercise concurrency pass a small positive delay.
+    setTimeout(() => child.emit("close", code), closeDelayMs)
     return child
   }
   return { calls, spawnImpl }
@@ -107,7 +111,9 @@ test("① 应用判定：参数是 plugin list + windowsHide，退出 0 → ok �
 })
 
 test("② 并发两次 → 仍只 spawn 一次（in-flight 复用），两次响应一致", async (t) => {
-  const f = await fixture(t, { fake: fakeSpawn({ code: 0 }) })
+  // Give the fake a short lifetime so both concurrent requests land inside the
+  // in-flight window, as they would against a real (slow) `plugin list`.
+  const f = await fixture(t, { fake: fakeSpawn({ code: 0, closeDelayMs: 50 }) })
   const [a, b] = await Promise.all([f.call("POST", "/api/apply-route", {}), f.call("POST", "/api/apply-route", {})])
   assert.equal(f.fake.calls.length, 1, "并发必须复用同一个 in-flight")
   assert.equal(a.body.ok, true)

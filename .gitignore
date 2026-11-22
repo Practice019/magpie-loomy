@@ -8,3 +8,6 @@ coverage/
 .env.*
 plugin-auth.json
 .DS_Store
+# 测试里把 Windows 风格路径 "D:/cfg" 当配置目录 key；在 Linux 上会落成
+# 名为 D: 的相对目录（测试残留，非项目文件）。两端都忽略，避免误提交。
+D:/
