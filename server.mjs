@@ -835,12 +835,11 @@ async function loadRouteModules() {
   if (typeof store?.readRouteState !== "function" || typeof store?.writeRouteState !== "function") return null
   return {
     /**
-     * 面板「检测」的唯一通道：**只读判定**（`probeRoute`）。
+     * 面板「检测」的唯一通道：**发一次真实 chat 读实际模型**（`probeRoute`）。
      *
-     * 目录 + 账本 + 余额，**0 积分**。原来还有一条 by-turn 通道（发一次计费
-     * chat、再用 TurnId 回查），T-38 整段删除：响应体每个 chunk 自带 `model`，
-     * 而「这一轮实际由谁服务」由 loader 旁路读取（见 `noteServedModel`），
-     * 不必再为它额外打一次上游。
+     * ①② 免费前置（目录 / 余额）命中即返回、0 积分；否则发一次与真实调用
+     * 同头同体的 chat（完整客户端 body 模板），读响应 SSE 的 `model` 分类。
+     * 每号 1 积分。账本分支保留在 `evaluateReadOnly`（不传 probeChat 时）给巡检用。
      */
     probeRoute: probe.probeRoute,
     readRouteState: store.readRouteState,
@@ -1272,8 +1271,9 @@ function probeAccountRoute(ctx, mods, uid, session) {
   if (inflight) return inflight
 
   const task = (async () => {
-    // 唯一通道：只读判定（`probeRoute`：目录 + 账本 + 余额，0 积分）。
-    // by-turn 那条通道（发一次计费 chat 再回查）T-38 已整段删除。
+    // 唯一通道：发一次真实 chat 读实际模型（`probeRoute`：①② 免费前置，
+    // 否则发 chat 读 SSE 的 model 分类；每号 1 积分）。
+    // 账本分支保留在 `evaluateReadOnly`（不传 probeChat 时）给巡检用。
     // ⚠ T-49：`ledgerReads`（设置里的「账本采样次数」）以前**存了却从未传下去**，
     //    改了不生效；这里按最新设置传给探测模块。
     const ledgerReads = probeLedgerReads(ctx)

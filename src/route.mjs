@@ -1,49 +1,45 @@
-// route.mjs 单账号一次性判定「这个账号还能不能派活」——**纯只读，0 积分**。
+// route.mjs 单账号一次性判定「这个账号还能不能派活」。
 //
-// # 为什么彻底不发 chat 了
+// # 发一次真实 chat，读响应里的实际模型
 //
-// 早期版本的判定要用一次 chat 换账本记录（`max_tokens: 1`，每次扣 1 积分）。
-// 产品最终决定：检测一律只读。好处是**检测从「每次 1 积分」变成「0 积分」**，
-// 可以随时全量跑；代价是**没有任何账本记录的新号无法判定** → `unknown`，
-// 等它被真实使用产生记录后自动可判（配合 `traffic` / `patrol`）。
+// 判定靠「这一轮实际由谁服务」：发一次与真实调用同头同体的 chat
+// （完整客户端 body 模板，messages 换成一条探针「不要思考，只回复一个hi」，
+// stream:true），从响应 SSE 每块的 data.model 直接读出实际模型再分类。
+// 这条路与 loader 的旁路观察一致，不依赖账本副本，新号也能立即判定。
+// 代价：每号 1 积分（换来即时、可信的判定）。
 //
-// # 只读判定链（顺序即优先级）
+// # 判定链（顺序即优先级）
 //
-//	① GET /models（token 头，15s）
+//	① GET /models（token 头，15s）   —— 免费前置否证
 //	   ├─ 401/403、100002/100003、过期字样  → expired（session-expired / account-disabled）
 //	   ├─ 有目录但无 DS4.1                  → routed（catalog-missing-ds41）
-//	   ├─ 目录完好                          → ②
-//	   └─ 读不到（5xx/网络）                → ②（**不判**：无法证明「没有」不等于「没有」）
-//	② GET /points/records（token 头，预检 1 次 + 复查 2 次，间隔 1s/3s）
-//	   ├─ code 100002/100003                → expired（同上）
-//	   ├─ availableBalance <= 0             → exhausted（no-quota）
-//	   ├─ 有 modelName 记录
-//	   │    ├─ spark* / 非 deepseek 族       → routed（ledger-spark / ledger-other-family）
-//	   │    └─ deepseek*                    → clean（ledger-deepseek）
-//	   └─ 没有任何 modelName 记录            → unknown（no-ledger-records）
+//	   ├─ 读不到（5xx/网络）                → 继续（不判：无法证明「没有」）
+//	   └─ 目录完好                          → ②
+//	② GET /points/records（token 头） —— 免费：availableBalance <= 0 → exhausted（no-quota）
+//	③ 发真实 chat（POST /chat/completions）—— 读响应 model
+//	   ├─ deepseek*                        → clean（ledger-deepseek）
+//	   ├─ spark* / 非 deepseek 族           → routed（ledger-spark / ledger-other-family）
+//	   └─ 读不到 model                      → unknown（保留原状态，不误判）
 //
-// 「其它族为什么也算 routed」：请求的是 DS4.1，账本却记到 GLM / Qwen / MiMo……
-// 这本身就是「请求被换成了别家的模型」，与 spark 同性质，账号同样不可信。
+// # 账本分支仍在（调用方不传 probeChat 时）
 //
-// # 账本为什么读 3 次
+// 不传 probeChat 的调用方（例如不愿花积分的巡检）走只读账本：读
+// /points/records 里最新一条 modelName。账本是多副本缓存，并发高时读到的副本
+// 更旧，所以预检 1 次 + 复查 2 次、取 createdAt 最大的一条。
 //
-// 账本是**多副本缓存**：并发高时读到的副本更旧（实测同一个健康号单独跑 clean、
-// 批量跑 unknown）。所以取「能看到的最新那条（createdAt 最大）」——预检 1 次
-// + 复查 2 次足以覆盖副本漂移；再多只是白等。
+// # 判定规则唯一
 //
-// # 与 patrol.mjs 的关系
-//
-// patrol 是「批量免费巡检」，probeRoute 是「单账号一次性判定」。**判定规则只有
-// 一份**：两者都调 `evaluateReadOnly()`。不要各写一份 —— 规则漂移过一次
-// （自述直测 vs 账本）已经够贵。
+// classifyLedgerModel() 是唯一分类入口：chat 读到的 model 与账本的 modelName 都
+// 走它。不要另写一份 —— 规则漂移过一次（自述直测 vs 账本）已经够贵。
 //
 // ⚠ 会静默出错的坑：业务失败也是 HTTP 200（AGENTS.md 坑 #1），判据必须看 code；
-// `reason` 收敛为 8 个固定值：session-expired / account-disabled /
+// reason 收敛为固定值：session-expired / account-disabled /
 // catalog-missing-ds41 / no-quota / ledger-spark / ledger-other-family /
-// ledger-deepseek / no-ledger-records。
+// ledger-deepseek / no-ledger-records.
 
-import { MODELS_PATH, OK_CODE } from "./constants.mjs"
-import { modelsAuth } from "./auth-headers.mjs"
+import { MODELS_PATH, OK_CODE, CHAT_PATH, CLIENT_USER_AGENT, CLIENT_ACCEPT_ENCODING } from "./constants.mjs"
+import { modelsAuth, chatHeaders } from "./auth-headers.mjs"
+import { buildClientBody } from "./client-body.mjs"
 import { pointsCall } from "./points.mjs"
 
 /** 被探测的模型名。上游 ID 大小写混排，原样照抄。 */
@@ -106,8 +102,120 @@ const MODEL_FAMILIES = Object.freeze(["deepseek", "glm", "qwen", "spark"])
  */
 class RouteProbeError extends Error {}
 
+/** 探测请求里那条 user 消息（固定文案：只要模型回一句，省输出积分）。 */
+const PROBE_CHAT_PROMPT = "不要思考，只回复一个hi"
+
+/** 探测 chat 的超时（毫秒）。 */
+const CHAT_PROBE_TIMEOUT_MS = 120_000
+
+/** 读流时最多缓冲多少字节（SSE 首个 data 行远小于它）。 */
+const CHAT_PROBE_PEEK_LIMIT = 64 * 1024
+
 /**
- * 单账号一次性判定（只读）。
+ * 从一段 SSE 文本里取第一个 data: 行的 JSON 的 model 字段。
+ * 非 JSON（[DONE]、心跳、空行）跳过；半截 JSON 也跳过（等下一块）。
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+function extractModelFromSse(text) {
+  const s = String(text ?? "")
+  if (!s) return ""
+  for (const line of s.split(/\r?\n/)) {
+    const raw = line.trim()
+    if (!raw.startsWith("data:")) continue
+    const payload = raw.slice("data:".length).trim()
+    if (!payload || payload === "[DONE]" || !payload.startsWith("{")) continue
+    try {
+      const obj = JSON.parse(payload)
+      const model = String(obj?.model ?? "").trim()
+      if (model) return model
+    } catch {
+      // 半截 JSON：还没读全，交给下一块
+    }
+  }
+  return ""
+}
+
+/**
+ * 发一次与真实调用同头同体的 chat，读响应 SSE 里的实际服务模型。
+ *
+ * 头：auth-headers.chatHeaders（Authorization + token + traceparent + loomy-version …）
+ *     + UA / Accept-Encoding（与 loader 一致）。
+ * 体：client-body.buildClientBody（完整客户端模板），messages 换成一条探针。
+ * 失败（超时 / 非 200 / 读不到 model）一律返回空串，由调用方保留原状态。
+ *
+ * @param {{root: string, session: string, fetchImpl?: typeof fetch, timeoutMs?: number}} opts
+ * @returns {Promise<string>} 实际 model；读不到返回空串
+ */
+async function probeChatModel({ root, session, fetchImpl, timeoutMs = CHAT_PROBE_TIMEOUT_MS } = {}) {
+  const doFetch = fetchImpl ?? ((...args) => globalThis.fetch(...args))
+  const headers = new Headers()
+  headers.set("User-Agent", CLIENT_USER_AGENT)
+  headers.set("Accept-Encoding", CLIENT_ACCEPT_ENCODING)
+  chatHeaders(headers, { session })
+  const body = JSON.stringify(
+    buildClientBody({
+      model: DS41_MODEL_ID,
+      messages: [{ role: "user", content: PROBE_CHAT_PROMPT }],
+    }),
+  )
+
+  let resp
+  try {
+    resp = await doFetch(String(root).replace(/\/+$/, "") + CHAT_PATH, {
+      method: "POST",
+      headers,
+      body,
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+  } catch {
+    return ""
+  }
+  if (Number(resp?.status) !== 200) {
+    try {
+      await resp?.body?.cancel?.()
+    } catch {
+      // 忽略
+    }
+    return ""
+  }
+
+  const stream = resp.body
+  if (!stream || typeof stream.getReader !== "function") {
+    const text = await resp.text().catch(() => "")
+    return extractModelFromSse(text)
+  }
+
+  const reader = stream.getReader()
+  const decoder = new TextDecoder()
+  let buf = ""
+  let bytes = 0
+  let found = ""
+  try {
+    while (bytes < CHAT_PROBE_PEEK_LIMIT) {
+      const { value, done } = await reader.read()
+      if (done) break
+      bytes += value?.byteLength ?? 0
+      buf += decoder.decode(value, { stream: true })
+      found = extractModelFromSse(buf)
+      if (found) break
+      if (buf.length > 32 * 1024) buf = buf.slice(-32 * 1024)
+    }
+  } catch {
+    // 读流失败：当作没读到
+  } finally {
+    try {
+      await reader.cancel()
+    } catch {
+      // 忽略
+    }
+  }
+  return found || extractModelFromSse(buf)
+}
+
+/**
+ * 单账号一次性判定（发一次真实 chat 读实际模型）。
  *
  * @param {object} opts
  * @param {string} opts.baseUrl 模型代理基址（含 `/api/v1`）
@@ -128,8 +236,11 @@ export async function probeRoute({
   ledgerReads = DEFAULT_LEDGER_READS,
   ledgerIntervalMs = DEFAULT_LEDGER_INTERVAL_MS,
   sleep,
+  probeChatTimeoutMs,
 } = {}) {
   if (!session) throw new RouteProbeError("loomy: 缺少 session，无法探测路由")
+  const root = String(baseUrl ?? "").replace(/\/+$/, "")
+  const doFetch = fetchImpl ?? ((...args) => globalThis.fetch(...args))
 
   const verdict = await evaluateReadOnly({
     baseUrl,
@@ -138,6 +249,10 @@ export async function probeRoute({
     ledgerReads,
     ledgerIntervalMs,
     sleep,
+    // ①② 免费前置先跑（目录 / 余额）；命中就直接返回，不发 chat。
+    // 需要真正判定时才发一次真实 chat 读实际模型（与真实调用同头同体）。
+    probeChat: () =>
+      probeChatModel({ root, session, fetchImpl: doFetch, timeoutMs: probeChatTimeoutMs }),
   })
 
   // probeRoute 的契约里 verdict 永远存在；内部 keep（这次没结论）翻译成 unknown，
@@ -179,6 +294,7 @@ export async function evaluateReadOnly({
   ledgerReads = DEFAULT_LEDGER_READS,
   ledgerIntervalMs = DEFAULT_LEDGER_INTERVAL_MS,
   sleep,
+  probeChat,
 } = {}) {
   const root = String(baseUrl ?? "").replace(/\/+$/, "")
   const doFetch = fetchImpl ?? ((...args) => globalThis.fetch(...args))
@@ -237,7 +353,32 @@ export async function evaluateReadOnly({
     })
   }
 
-  // ── ③ 账本最新记录（取 createdAt 最大的一条） ─────────────────────────
+  // ── ③ 真实 chat：读响应里的实际模型（调用方给了 probeChat 时走这条）──
+  if (typeof probeChat === "function") {
+    let served = ""
+    try {
+      served = String(await probeChat()).trim()
+    } catch {
+      served = ""
+    }
+    const cls = classifyLedgerModel(served)
+    if (cls) {
+      return result({
+        verdict: cls.verdict,
+        reason: cls.reason,
+        servedModel: cls.servedModel,
+        evidence: { ledgerModelName: served, catalog: catalogEvidence },
+      })
+    }
+    // 没读到模型：不误判，交给调用方保留原状态。
+    return result({
+      keep: true,
+      reason: "no-ledger-records",
+      evidence: { ledgerModelName: served, catalog: catalogEvidence },
+    })
+  }
+
+  // ── ③' 账本最新记录（未给 probeChat 时；取 createdAt 最大的一条）────────
   let ledger
   try {
     ledger = await readLatestLedgerRecord({
