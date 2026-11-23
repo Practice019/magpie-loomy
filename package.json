@@ -1,6 +1,6 @@
 {
   "name": "magpie-loomy",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "Loomy（讯飞 Loomy 桌面端）provider plugin for magpie：三种登录、实时模型目录、双积分池、新手任务与邀请码面板、批量导入",
   "type": "module",
   "main": "./index.mjs",
