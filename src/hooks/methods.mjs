@@ -120,6 +120,9 @@ export function makeMethods(opts = {}) {
   const log = opts.log ?? console
   // 状态文件落在 magpie 的配置目录下（index.mjs 已经把它传进来了）
   const configDir = String(opts.configDir ?? process.env.MAGPIE_CONFIG_DIR ?? "").trim()
+  // 本机客户端登录态只存在于 Windows；Linux/macOS 下明确提示改用短信/粘贴。
+  // 测试可用 platform 选项模拟 Windows，避免与真实运行环境耦合。
+  const platform = String(opts.platform ?? process.platform)
 
   /**
    * 收尾：包成 magpie 要的登录结果，并在**后台**触发补初始化 + DS4.1 路由探测。
@@ -156,6 +159,12 @@ export function makeMethods(opts = {}) {
      * 免得 authorize 卡住导致 magpie 拿不到 url 而死锁。
      */
     async authorize() {
+      if (platform !== "win32") {
+        return {
+          type: "failed",
+          error: "「本机客户端登录态」只支持 Windows。请在 Linux 上使用「手机号 + 短信验证码」或「粘贴 session」登录。",
+        }
+      }
       const dir = opts.clientStoreDir ?? defaultClientStoreDir()
       if (!dir) {
         return {

@@ -333,6 +333,7 @@ test("④ 本机登录态 callback 也立即返回（探测挂起）", async (t)
   const started = new Promise((r) => { entered = r })
   const m = makeMethods({
     clientStoreDir: dir,
+    platform: "win32",
     configDir: "",
     log: { warn() {} },
     routeModules: { probeRoute: async () => { entered(); return new Promise(() => {}) }, writeRouteState: () => {} },

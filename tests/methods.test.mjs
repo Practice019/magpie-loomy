@@ -75,7 +75,7 @@ test("粘贴 session：账号名优先手机号", async () => {
 })
 
 test("本机导入：没有客户端目录时返回 failed 并说清怎么办", async () => {
-  const m = makeMethods({ fetchImpl: okUpstream(), clientStoreDir: "" })
+  const m = makeMethods({ fetchImpl: okUpstream(), clientStoreDir: "", platform: "win32" })
   const local = m[0]
   const r = await local.authorize()
   assert.equal(r.type, "failed")
@@ -88,9 +88,18 @@ test("本机导入：authorize 立刻返回，不在里面发请求", async () =
     called += 1
     return new Response("{}", { status: 200 })
   }
-  const m = makeMethods({ fetchImpl: counting, clientStoreDir: "" })
+  const m = makeMethods({ fetchImpl: counting, clientStoreDir: "", platform: "win32" })
   await m[0].authorize()
   assert.equal(called, 0, "authorize 里不能有网络请求（会死锁）")
+})
+
+test("Linux 下本机客户端登录明确提示改用短信或粘贴", async () => {
+  const m = makeMethods({ fetchImpl: okUpstream(), platform: "linux" })
+  const local = m[0]
+  const r = await local.authorize()
+  assert.equal(r.type, "failed")
+  assert.match(r.error, /只支持 Windows/)
+  assert.match(r.error, /短信验证码.*粘贴 session/)
 })
 
 test("手机号：ask 先问手机号，再问验证码", async () => {
