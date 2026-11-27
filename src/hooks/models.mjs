@@ -195,9 +195,10 @@ export function makeModelsHook(opts = {}) {
 
   return async function models(provider, ctx = {}) {
     const auth = ctx?.auth
-    // 未登录：回静态表（否则界面上这个供应商一个模型都没有）
+    // 未登录：回静态表（否则界面上这个供应商一个模型都没有）。
+    // 静态表不是账号自己的计划 ⇒ 标 fellBack，宿主就不会按它派活（CONTRACT 6-02）。
     if (!auth?.access) {
-      return toMagpieModels(provider, staticEntries())
+      return fellBackOf(toMagpieModels(provider, staticEntries()))
     }
 
     // ── ① 置空判定：这个号不该再收到任何请求（**排在缓存之前**）──
@@ -256,7 +257,7 @@ export function makeModelsHook(opts = {}) {
         log,
       })
       const listed = !live || live.length === 0
-        ? toMagpieModels(provider, staticEntries())
+        ? fellBackOf(toMagpieModels(provider, staticEntries()))
         : toMagpieModels(provider, live.map(withMultiplier))
       // ── ② 慢号让位（零请求，只读 `<configDir>/loomy-speed-cache.json`）──
       //
@@ -268,7 +269,8 @@ export function makeModelsHook(opts = {}) {
     } catch (e) {
       // ⚠ 不抛：抛了宿主也只会保留旧列表，但日志里就没有线索了。
       log.warn?.(`loomy: 拉取实时模型目录失败，回退静态表: ${e?.message ?? e}`)
-      return applySpeedSkip(toMagpieModels(provider, staticEntries()), {
+      // 回退的静态表不是账号自己的计划 ⇒ 标 fellBack（CONTRACT 6-02）。
+      return applySpeedSkip(fellBackOf(toMagpieModels(provider, staticEntries())), {
         auth,
         configDir,
         log,
@@ -543,6 +545,16 @@ export async function fetchCatalog(opts) {
 }
 
 /** 把实测快照转成同样的形状。 */
+/**
+ * fellBackOf 给"不是账号自己的列表"打宿主认的标记（CONTRACT 6-02）。
+ * 宿主读 Symbol.for("magpie.fellBack")，带标记的列表**不参与路由**。
+ * ⚠ 只标**回退**（未登录 / 上游空 / 拉取失败）；命中缓存那条路不标 —— 缓存内容
+ *   本来就是上游给的，是这个账号的计划。
+ */
+function fellBackOf(models) {
+  return Object.assign({ ...(models ?? {}) }, { [Symbol.for("magpie.fellBack")]: true })
+}
+
 function staticEntries() {
   const list = availableModels().map((m) => ({
     id: m.id,
